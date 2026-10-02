@@ -1,0 +1,16 @@
+[package]
+name = "xdp-guard-ebpf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+aya-ebpf = "0.2.1"
+aya-log-ebpf = "0.2.0"
+xdp-guard-common = { path = "../xdp-guard-common" }
+network-types = "0.0.7"
+
+[[bin]]
+name = "xdp-guard-ebpf"
+path = "src/main.rs"

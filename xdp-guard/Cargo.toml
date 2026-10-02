@@ -1,0 +1,19 @@
+[package]
+name = "xdp-guard"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+aya = "0.13"
+aya-log = "0.2"
+xdp-guard-common = { path = "../xdp-guard-common", features = ["user"] }
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.38", features = ["full"] }
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
+colored = "2.1"
+bytesize = "1.3"
+chrono = "0.4"

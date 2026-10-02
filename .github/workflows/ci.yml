@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-verify:
+    name: Build & Verify (eBPF Kernel + Userspace CLI)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libelf-dev clang llvm
+
+      - name: Install Rust Stable (for Userspace & CLI)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install Rust Nightly (for eBPF Kernel bytecode)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install bpf-linker
+        uses: taiki-e/install-action@bpf-linker
+
+      - name: Build eBPF Kernel Program
+        run: cargo run --package xtask -- build-ebpf
+
+      - name: Verify eBPF Bytecode Artifact
+        run: |
+          ls -lh target/bpfel-unknown-none/release/xdp-guard-ebpf
+          test -s target/bpfel-unknown-none/release/xdp-guard-ebpf
+
+      - name: Build Userspace CLI & Common Crates
+        run: cargo +stable build --release --package xdp-guard --package xdp-guard-common
+
+      - name: Run Clippy (Userspace)
+        continue-on-error: true
+        run: cargo +stable clippy --package xdp-guard --package xdp-guard-common
