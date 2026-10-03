@@ -1,6 +1,7 @@
 # xdp-guard
 
 [![CI](https://github.com/rahadbhuiya/xdp-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/rahadbhuiya/xdp-guard/actions/workflows/ci.yml)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23120995.svg)](https://doi.org/10.5281/zenodo.23120995)
 [![License: MIT / Apache-2.0](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue.svg)](LICENSE)
 [![Framework: Aya](https://img.shields.io/badge/eBPF-Aya-orange.svg)](https://github.com/aya-rs/aya)
 
@@ -123,6 +124,23 @@ All drops occur directly inside the XDP driver hook with zero CPU cycles spent p
 - **Rahad Bhuiya** ([@rahadbhuiya](https://github.com/rahadbhuiya))
   - Core contributor to `aya-rs/aya` (Linux Kernel eBPF Framework)
   - Author of Exploidus OS and Yolish Language
+
+## Citation
+
+If you use `xdp-guard` or reference its in-kernel architecture in your research, please cite:
+
+```bibtex
+@software{bhuiya_xdp_guard_2026,
+  author       = {Rahad Bhuiya},
+  title        = {xdp-guard: Memory-Safe In-Kernel XDP Firewall \& Per-IP Rate Limiter in Pure Rust},
+  month        = oct,
+  year         = 2026,
+  publisher    = {Zenodo},
+  version      = {v0.1.0},
+  doi          = {10.5281/zenodo.23120995},
+  url          = {https://doi.org/10.5281/zenodo.23120995}
+}
+```
 
 ## License
 
