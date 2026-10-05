@@ -17,7 +17,7 @@ use aya_ebpf::{
     bindings::xdp_action,
     helpers::bpf_ktime_get_ns,
     macros::{map, xdp},
-    maps::{Array, HashMap},
+    maps::{Array, HashMap, LruHashMap},
     programs::XdpContext,
 };
 use network_types::{
@@ -44,10 +44,12 @@ static ALLOWLIST_MAP: HashMap<u32, RuleValue> = HashMap::<u32, RuleValue>::with_
 #[map]
 static BLOCKLIST_MAP: HashMap<u32, RuleValue> = HashMap::<u32, RuleValue>::with_max_entries(65536, 0);
 
-/// Map 2: Per-IP Token-Bucket Rate Limiter State
-/// Tracks packet counts and timestamps to prevent single-source volumetric floods.
+/// Map 2: Per-IP Token-Bucket Rate Limiter State (LRU Eviction)
+/// Tracks packet counts and timestamps using an in-kernel LRU cache.
+/// If capacity is exhausted under spoofed floods, the oldest entries
+/// are evicted automatically by the kernel without leaking unmetered packets.
 #[map]
-static RATE_LIMIT_MAP: HashMap<u32, RateLimitState> = HashMap::<u32, RateLimitState>::with_max_entries(131072, 0);
+static RATE_LIMIT_MAP: LruHashMap<u32, RateLimitState> = LruHashMap::<u32, RateLimitState>::with_max_entries(131072, 0);
 
 /// Map 3: Telemetry & Metrics Counters
 /// Index 0 stores the global packet statistics (packets passed, bytes passed, dropped, etc.).
@@ -87,6 +89,16 @@ fn record_metric(passed: bool, packet_bytes: u64) {
                 (*stats_ptr).dropped_packets += 1;
                 (*stats_ptr).dropped_bytes += packet_bytes;
             }
+        }
+    }
+}
+
+/// Increments the map insertion failure counter in the BPF Array Map.
+#[inline(always)]
+fn record_insert_failure() {
+    if let Some(stats_ptr) = STATS_MAP.get_ptr_mut(0) {
+        unsafe {
+            (*stats_ptr).map_insert_failures += 1;
         }
     }
 }
@@ -179,9 +191,14 @@ fn try_xdp_guard(ctx: &XdpContext) -> Result<u32, ()> {
                 tokens: RATE_LIMIT_CAPACITY.saturating_sub(1),
                 last_update_ns: now_ns,
             };
-            let _ = RATE_LIMIT_MAP.insert(&src_ip, &initial_state, 0);
-            record_metric(true, packet_len);
-            Ok(xdp_action::XDP_PASS)
+            if RATE_LIMIT_MAP.insert(&src_ip, &initial_state, 0).is_err() {
+                record_insert_failure();
+                record_metric(false, packet_len);
+                Ok(xdp_action::XDP_DROP)
+            } else {
+                record_metric(true, packet_len);
+                Ok(xdp_action::XDP_PASS)
+            }
         }
     }
 }

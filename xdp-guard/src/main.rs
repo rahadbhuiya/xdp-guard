@@ -272,8 +272,8 @@ async fn main() -> Result<()> {
 }
 
 async fn monitor_stats_loop(array: Array<MapData, PacketStats>) -> Result<()> {
-    println!("{:<20} {:<15} {:<15} {:<15}", "TIMESTAMP", "PASSED (PKTS)", "DROPPED (PKTS)", "DROP RATIO");
-    println!("-----------------------------------------------------------------");
+    println!("{:<10} | {:<24} | {:<24} | {:<16} | {:<10}", "TIME", "PASSED", "DROPPED", "MAP FAILURES", "DROP RATIO");
+    println!("-------------------------------------------------------------------------------------------------");
 
     let mut last_dropped = 0;
     let mut last_passed = 0;
@@ -290,12 +290,13 @@ async fn monitor_stats_loop(array: Array<MapData, PacketStats>) -> Result<()> {
             };
 
             println!(
-                "{} | Pass: {:<8} ({}) | Drop: {:<8} ({}) | Ratio: {:.2}%",
+                "{} | Pass: {:<8} ({:<8}) | Drop: {:<8} ({:<8}) | Failures: {:<6} | Ratio: {:.2}%",
                 chrono::Local::now().format("%H:%M:%S"),
                 delta_passed,
                 ByteSize::b(stats.passed_bytes),
                 delta_dropped,
                 ByteSize::b(stats.dropped_bytes),
+                stats.map_insert_failures,
                 ratio
             );
 
@@ -307,8 +308,8 @@ async fn monitor_stats_loop(array: Array<MapData, PacketStats>) -> Result<()> {
 }
 
 async fn monitor_live_stats(stats_path: &str) -> Result<()> {
-    println!("{:<20} {:<15} {:<15} {:<15}", "TIMESTAMP", "PASSED (PKTS)", "DROPPED (PKTS)", "DROP RATIO");
-    println!("-----------------------------------------------------------------");
+    println!("{:<10} | {:<24} | {:<24} | {:<16} | {:<10}", "TIME", "PASSED", "DROPPED", "MAP FAILURES", "DROP RATIO");
+    println!("-------------------------------------------------------------------------------------------------");
 
     #[cfg(target_os = "linux")]
     {
