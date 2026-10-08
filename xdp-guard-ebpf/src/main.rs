@@ -226,8 +226,48 @@ fn try_xdp_guard(ctx: &XdpContext) -> Result<u32, ()> {
 
     let now_ns = unsafe { bpf_ktime_get_ns() };
 
-    // STEP 5: Tier 1 - /24 Subnet-Level Aggregate Limiter
-    // Prevents host-randomized floods within the same subnet prefix from bypassing limits.
+    // STEP 5: Fast-Path for Known / Active Flows
+    // If the source IP already has an entry in RATE_LIMIT_MAP, enforce per-IP bucket directly.
+    let state = RATE_LIMIT_MAP.get_ptr_mut(&src_ip);
+    if let Some(state_ptr) = state {
+        let allowed = unsafe {
+            try_consume_token(&mut *state_ptr, PER_IP_CAPACITY, PER_IP_REFILL_RATE_NS, now_ns)
+        };
+        if allowed {
+            record_metric(true, packet_len);
+            return Ok(xdp_action::XDP_PASS);
+        } else {
+            record_metric(false, packet_len);
+            return Ok(xdp_action::XDP_DROP);
+        }
+    }
+
+    // STEP 6: Unseen / Unknown Source Gate (Ingress Admission Control)
+    // To prevent randomized-IP floods from churning either the per-IP LRU (131k) or the
+    // /24 subnet LRU (32k), unseen flows must first draw from the shared admission budget.
+    // Under a uniformly random spoofed flood, this admission pool drains in milliseconds,
+    // and all subsequent unseen packets are dropped at wire-speed with zero map churn.
+    let admission_ptr = match ADMISSION_MAP.get_ptr_mut(0) {
+        Some(ptr) => ptr,
+        None => {
+            record_metric(false, packet_len);
+            return Ok(xdp_action::XDP_DROP);
+        }
+    };
+
+    let admitted = unsafe {
+        try_consume_token(&mut *admission_ptr, ADMISSION_CAPACITY, ADMISSION_REFILL_RATE_NS, now_ns)
+    };
+
+    if !admitted {
+        record_admission_drop();
+        record_metric(false, packet_len);
+        return Ok(xdp_action::XDP_DROP);
+    }
+
+    // STEP 7: Tier 1 - /24 Subnet-Level Aggregate Limiter
+    // Flow passed admission. Now check the aggregate subnet budget to prevent concentrated
+    // prefix flooding from a single rogue network.
     let subnet_prefix = src_ip & 0xFFFF_FF00;
     let subnet_state = SUBNET_RATE_LIMIT_MAP.get_ptr_mut(&subnet_prefix);
 
@@ -251,60 +291,19 @@ fn try_xdp_guard(ctx: &XdpContext) -> Result<u32, ()> {
         }
     }
 
-    // STEP 6: Tier 2 - Per-IP Rate Limiter with Ingress Admission Control
-    let state = RATE_LIMIT_MAP.get_ptr_mut(&src_ip);
+    // STEP 8: Allocate New Flow Entry in Tier 2 LRU with Conservative Burst
+    let initial_state = RateLimitState {
+        tokens: INITIAL_BURST_TOKENS.saturating_sub(1),
+        last_update_ns: now_ns,
+    };
 
-    match state {
-        Some(state_ptr) => {
-            let allowed = unsafe {
-                try_consume_token(&mut *state_ptr, PER_IP_CAPACITY, PER_IP_REFILL_RATE_NS, now_ns)
-            };
-            if allowed {
-                record_metric(true, packet_len);
-                Ok(xdp_action::XDP_PASS)
-            } else {
-                record_metric(false, packet_len);
-                Ok(xdp_action::XDP_DROP)
-            }
-        }
-        None => {
-            // First time seeing this IP (Unseen Source):
-            // Require consuming a token from the shared Admission Budget.
-            // Under randomized-IP floods, this budget is exhausted immediately, dropping spoofed packets
-            // and protecting the LRU map from churn and legitimate flow eviction.
-            let admission_ptr = match ADMISSION_MAP.get_ptr_mut(0) {
-                Some(ptr) => ptr,
-                None => {
-                    record_metric(false, packet_len);
-                    return Ok(xdp_action::XDP_DROP);
-                }
-            };
-
-            let admitted = unsafe {
-                try_consume_token(&mut *admission_ptr, ADMISSION_CAPACITY, ADMISSION_REFILL_RATE_NS, now_ns)
-            };
-
-            if !admitted {
-                record_admission_drop();
-                record_metric(false, packet_len);
-                return Ok(xdp_action::XDP_DROP);
-            }
-
-            // Flow admitted: grant a conservative initial burst (10 tokens, not 1000)
-            let initial_state = RateLimitState {
-                tokens: INITIAL_BURST_TOKENS.saturating_sub(1),
-                last_update_ns: now_ns,
-            };
-
-            if RATE_LIMIT_MAP.insert(&src_ip, &initial_state, 0).is_err() {
-                record_insert_failure();
-                record_metric(false, packet_len);
-                Ok(xdp_action::XDP_DROP)
-            } else {
-                record_metric(true, packet_len);
-                Ok(xdp_action::XDP_PASS)
-            }
-        }
+    if RATE_LIMIT_MAP.insert(&src_ip, &initial_state, 0).is_err() {
+        record_insert_failure();
+        record_metric(false, packet_len);
+        Ok(xdp_action::XDP_DROP)
+    } else {
+        record_metric(true, packet_len);
+        Ok(xdp_action::XDP_PASS)
     }
 }
 
