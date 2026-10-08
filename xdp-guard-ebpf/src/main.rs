@@ -184,7 +184,7 @@ fn try_xdp_guard(ctx: &XdpContext) -> Result<u32, ()> {
     };
 
     let ether_type_raw = unsafe { core::ptr::addr_of!((*eth_hdr_ptr).ether_type).read_unaligned() };
-    let mut ether_type_val = u16::from(ether_type_raw);
+    let mut ether_type_val = ether_type_raw as u16;
     let mut l3_offset = EthHdr::LEN;
 
     // Handle IEEE 802.1Q / 802.1ad (VLAN / QinQ) encapsulation
@@ -199,7 +199,7 @@ fn try_xdp_guard(ctx: &XdpContext) -> Result<u32, ()> {
     }
 
     // Only filter IPv4 traffic; pass non-IPv4 (ARP, IPv6, etc.) to the OS stack
-    if ether_type_val != u16::from(EtherType::Ipv4) {
+    if ether_type_val != EtherType::Ipv4 as u16 {
         return Ok(xdp_action::XDP_PASS);
     }
 
