@@ -272,8 +272,8 @@ async fn main() -> Result<()> {
 }
 
 async fn monitor_stats_loop(array: Array<MapData, PacketStats>) -> Result<()> {
-    println!("{:<10} | {:<24} | {:<24} | {:<16} | {:<10}", "TIME", "PASSED", "DROPPED", "MAP FAILURES", "DROP RATIO");
-    println!("-------------------------------------------------------------------------------------------------");
+    println!("{:<10} | {:<20} | {:<20} | {:<16} | {:<14} | {:<10}", "TIME", "PASSED", "DROPPED", "ADM DROPS", "SUBNET DROPS", "DROP RATIO");
+    println!("--------------------------------------------------------------------------------------------------------------------");
 
     let mut last_dropped = 0;
     let mut last_passed = 0;
@@ -290,13 +290,14 @@ async fn monitor_stats_loop(array: Array<MapData, PacketStats>) -> Result<()> {
             };
 
             println!(
-                "{} | Pass: {:<8} ({:<8}) | Drop: {:<8} ({:<8}) | Failures: {:<6} | Ratio: {:.2}%",
+                "{} | Pass: {:<7} ({:<6}) | Drop: {:<7} ({:<6}) | Adm: {:<10} | Subnet: {:<8} | Ratio: {:.2}%",
                 chrono::Local::now().format("%H:%M:%S"),
                 delta_passed,
                 ByteSize::b(stats.passed_bytes),
                 delta_dropped,
                 ByteSize::b(stats.dropped_bytes),
-                stats.map_insert_failures,
+                stats.admission_drops,
+                stats.subnet_drops,
                 ratio
             );
 
@@ -308,8 +309,8 @@ async fn monitor_stats_loop(array: Array<MapData, PacketStats>) -> Result<()> {
 }
 
 async fn monitor_live_stats(stats_path: &str) -> Result<()> {
-    println!("{:<10} | {:<24} | {:<24} | {:<16} | {:<10}", "TIME", "PASSED", "DROPPED", "MAP FAILURES", "DROP RATIO");
-    println!("-------------------------------------------------------------------------------------------------");
+    println!("{:<10} | {:<20} | {:<20} | {:<16} | {:<14} | {:<10}", "TIME", "PASSED", "DROPPED", "ADM DROPS", "SUBNET DROPS", "DROP RATIO");
+    println!("--------------------------------------------------------------------------------------------------------------------");
 
     #[cfg(target_os = "linux")]
     {

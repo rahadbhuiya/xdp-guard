@@ -14,9 +14,12 @@ A high-performance, line-rate Linux kernel firewall and per-IP rate limiter buil
 ## Key Features
 
 - **Driver-Level Packet Filtering (`XDP_DROP`)**: Discards unwanted or malicious packets with near-zero CPU overhead.
-- **In-Kernel Token-Bucket Rate Limiter**: Automatically restricts individual IPv4 sources exceeding configured thresholds (e.g., 1000 pps) while permitting legitimate bursts.
+- **Two-Tier Rate Limiting**: Layered rate limiting combining a `/24` subnet aggregate token bucket with per-IP LRU token buckets to suppress host-rotating floods.
+- **Ingress Admission Control**: Shared admission token bucket for unseen sources preventing randomized-IP floods from bypassing limits or churning state tables.
+- **IEEE 802.1Q (VLAN & QinQ) Parsing**: Inspects encapsulated packets to eliminate L2 evasion vectors.
+- **Drift-Free Fractional Refills**: Preserves sub-millisecond residual nanoseconds across arrivals for precise token refills at line rate.
 - **Dynamic BPF Maps**: Update firewall rules (blocklist and allowlist) on the fly from the userspace CLI without stopping or recompiling the kernel program.
-- **Real-Time Telemetry**: Live packet statistics tracking passed packets, dropped packets, and line-rate drop ratios.
+- **Real-Time Telemetry**: Live packet statistics tracking passed, dropped, admission-dropped, and subnet-dropped packets.
 - **Pure Rust**: Powered by Aya eliminating C compiler toolchain dependencies for application builds.
 
 ---

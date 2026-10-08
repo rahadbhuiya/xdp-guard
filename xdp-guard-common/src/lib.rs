@@ -70,6 +70,10 @@ pub struct PacketStats {
     pub dropped_bytes: u64,
     /// Total map insertion failures under extreme state table exhaustion.
     pub map_insert_failures: u64,
+    /// Total packets dropped due to new-source admission budget exhaustion under spoofed floods.
+    pub admission_drops: u64,
+    /// Total packets dropped by /24 subnet aggregate rate limiting.
+    pub subnet_drops: u64,
 }
 
 // Implement aya::Pod marker trait so userspace Aya can read/write these structs to BPF maps
