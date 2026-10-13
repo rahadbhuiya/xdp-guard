@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
 description = "High-performance eBPF/XDP packet filter and DDoS mitigation CLI and daemon"
 keywords = ["xdp", "ebpf", "ddos", "firewall", "security"]
 categories = ["command-line-utilities", "network-programming"]
@@ -12,7 +13,7 @@ categories = ["command-line-utilities", "network-programming"]
 [dependencies]
 aya = "0.13"
 aya-log = "0.2"
-xdp-guard-common = { path = "../xdp-guard-common", version = "0.2.0", features = ["user"] }
+xdp-guard-common = { path = "../xdp-guard-common", version = "0.2.1", features = ["user"] }
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1.38", features = ["full"] }
 anyhow = "1.0"
