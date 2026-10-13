@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Common data structures and rule definitions for xdp-guard high-performance eBPF/XDP firewall"
+keywords = ["xdp", "ebpf", "ddos", "networking", "no-std"]
+categories = ["network-programming", "no-std"]
 
 [features]
 default = []
