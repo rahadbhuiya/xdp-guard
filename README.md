@@ -1,5 +1,6 @@
 # xdp-guard
 
+[![Crates.io](https://img.shields.io/crates/v/xdp-guard.svg)](https://crates.io/crates/xdp-guard)
 [![CI](https://github.com/rahadbhuiya/xdp-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/rahadbhuiya/xdp-guard/actions/workflows/ci.yml)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23120995.svg)](https://doi.org/10.5281/zenodo.23120995)
 [![License: MIT / Apache-2.0](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue.svg)](LICENSE)
@@ -8,6 +9,14 @@
 A high-performance, line-rate Linux kernel firewall and per-IP rate limiter built in Rust using the Aya eBPF framework.
 
 > **Production Purpose**: Defend Linux servers, container clusters, and cloud workloads against volumetric DDoS and Layer-3/Layer-4 network floods directly at the Network Interface Card (NIC) driver level, before packets touch the OS network stack.
+
+### Quick Install
+
+```bash
+cargo install xdp-guard
+# or via install script
+curl -sSf https://raw.githubusercontent.com/rahadbhuiya/xdp-guard/main/install.sh | sudo sh
+```
 
 ---
 
