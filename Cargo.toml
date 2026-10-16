@@ -5,6 +5,7 @@ members = [
     "xdp-guard-ebpf",
     "xtask",
 ]
+default-members = ["xdp-guard", "xdp-guard-common", "xtask"]
 resolver = "2"
 
 [workspace.package]
