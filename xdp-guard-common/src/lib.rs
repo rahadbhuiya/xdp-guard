@@ -74,6 +74,12 @@ pub struct PacketStats {
     pub admission_drops: u64,
     /// Total packets dropped by /24 subnet aggregate rate limiting.
     pub subnet_drops: u64,
+    /// Total TCP SYN packets received.
+    pub tcp_syn_packets: u64,
+    /// Total TCP SYN flood packets dropped at line-rate.
+    pub tcp_syn_drops: u64,
+    /// Total UDP reflection/amplification flood packets dropped.
+    pub udp_reflection_drops: u64,
 }
 
 // Implement aya::Pod marker trait so userspace Aya can read/write these structs to BPF maps

@@ -22,13 +22,17 @@ curl -sSf https://raw.githubusercontent.com/rahadbhuiya/xdp-guard/main/install.s
 
 ## Key Features
 
-- **Driver-Level Packet Filtering (`XDP_DROP`)**: Discards unwanted or malicious packets with near-zero CPU overhead.
+- **Driver-Level Packet Filtering (`XDP_DROP`)**: Discards unwanted or malicious packets with near-zero CPU overhead at line rate.
+- **Layer-4 Stateful TCP SYN Flood Mitigation**: Dedicated LRU token bucket tracking TCP SYN handshake rates per IP to neutralize SYN-flood connection table exhaustion before reaching OS socket backlogs.
+- **UDP Amplification & Reflection Defense**: In-kernel detection and throttling of oversized reflection traffic from well-known vector ports (DNS 53, NTP 123, SSDP 1900, Memcached 11211, CLDAP 389).
 - **Two-Tier Rate Limiting**: Layered rate limiting combining a `/24` subnet aggregate token bucket with per-IP LRU token buckets to suppress host-rotating floods.
 - **Ingress Admission Control**: Shared admission token bucket for unseen sources preventing randomized-IP floods from bypassing limits or churning state tables.
+- **Cloud-Native Prometheus Exporter**: Native async HTTP metrics daemon (`xdp-guard exporter`) exposing standard Prometheus metrics on `:9184/metrics` and health endpoints.
+- **Kubernetes DaemonSet Architecture**: Turnkey Helm-compatible DaemonSet manifest and ServiceMonitor for cluster-wide worker node protection across multi-cloud and bare-metal environments.
+- **Enterprise Grafana Dashboards**: Out-of-the-box Grafana JSON dashboard delivering real-time visualization of passed vs dropped PPS, bandwidth savings, and multi-vector threat categorization.
 - **IEEE 802.1Q (VLAN & QinQ) Parsing**: Inspects encapsulated packets to eliminate L2 evasion vectors.
 - **Drift-Free Fractional Refills**: Preserves sub-millisecond residual nanoseconds across arrivals for precise token refills at line rate.
 - **Dynamic BPF Maps**: Update firewall rules (blocklist and allowlist) on the fly from the userspace CLI without stopping or recompiling the kernel program.
-- **Real-Time Telemetry**: Live packet statistics tracking passed, dropped, admission-dropped, and subnet-dropped packets.
 - **Pure Rust**: Powered by Aya eliminating C compiler toolchain dependencies for application builds.
 
 ---
@@ -104,8 +108,15 @@ sudo ./target/release/xdp-guard block 192.168.1.50
 # 3. Allowlist trusted traffic
 sudo ./target/release/xdp-guard allow 10.0.0.1
 
-# 4. View live telemetry
+# 4. View live terminal telemetry
 sudo ./target/release/xdp-guard stats
+
+# 5. Run Prometheus metrics exporter daemon
+sudo ./target/release/xdp-guard exporter --listen 0.0.0.0:9184
+
+# 6. Deploy cluster-wide on Kubernetes
+kubectl apply -f k8s/daemonset.yaml
+kubectl apply -f k8s/service-monitor.yaml
 ```
 
 ---

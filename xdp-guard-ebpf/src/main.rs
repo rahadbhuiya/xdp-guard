@@ -21,7 +21,9 @@ use aya_ebpf::{
 };
 use network_types::{
     eth::{EthHdr, EtherType},
-    ip::Ipv4Hdr,
+    ip::{IpProto, Ipv4Hdr},
+    tcp::TcpHdr,
+    udp::UdpHdr,
 };
 use xdp_guard_common::{PacketStats, RateLimitState, RuleValue};
 
@@ -37,6 +39,10 @@ const SUBNET_REFILL_RATE_NS: u64 = 200_000; // 1 token every 200us (5,000 pkts/s
 /// Ingress Admission Control for Unknown Flows
 const ADMISSION_CAPACITY: u64 = 2000; // Burst budget for admitting new/unseen sources
 const ADMISSION_REFILL_RATE_NS: u64 = 500_000; // 2,000 new source admissions / sec
+
+/// Layer-4 TCP SYN Flood Mitigation
+const TCP_SYN_BURST_CAPACITY: u64 = 64; // Max burst of new TCP connection attempts per IP
+const TCP_SYN_REFILL_RATE_NS: u64 = 10_000_000; // 1 token every 10ms (100 new connections/sec per IP)
 
 /// IEEE 802.1Q VLAN EtherTypes
 const ETH_P_8021Q: u16 = 0x8100;
@@ -70,6 +76,10 @@ static ADMISSION_MAP: Array<RateLimitState> = Array::<RateLimitState>::with_max_
 /// Map 5: Telemetry & Metrics Counters
 #[map]
 static STATS_MAP: Array<PacketStats> = Array::<PacketStats>::with_max_entries(1, 0);
+
+/// Map 6: Layer-4 TCP SYN Rate Limiter (Mitigates SYN-flood backlog exhaustion)
+#[map]
+static TCP_SYN_RATE_LIMIT_MAP: LruHashMap<u32, RateLimitState> = LruHashMap::<u32, RateLimitState>::with_max_entries(65536, 0);
 
 // HELPER FUNCTIONS
 
@@ -163,6 +173,29 @@ fn record_subnet_drop() {
     }
 }
 
+/// Tracks TCP SYN packets and SYN-flood line-rate drops.
+#[inline(always)]
+fn record_tcp_syn(dropped: bool) {
+    if let Some(stats_ptr) = STATS_MAP.get_ptr_mut(0) {
+        unsafe {
+            (*stats_ptr).tcp_syn_packets += 1;
+            if dropped {
+                (*stats_ptr).tcp_syn_drops += 1;
+            }
+        }
+    }
+}
+
+/// Increments UDP reflection/amplification attack drop counter.
+#[inline(always)]
+fn record_udp_reflection_drop() {
+    if let Some(stats_ptr) = STATS_MAP.get_ptr_mut(0) {
+        unsafe {
+            (*stats_ptr).udp_reflection_drops += 1;
+        }
+    }
+}
+
 // MAIN XDP PROGRAM HOOK
 
 #[xdp]
@@ -225,6 +258,55 @@ fn try_xdp_guard(ctx: &XdpContext) -> Result<u32, ()> {
     }
 
     let now_ns = unsafe { bpf_ktime_get_ns() };
+
+    let ip_proto = unsafe { core::ptr::addr_of!((*ip_hdr_ptr).proto).read_unaligned() };
+    let ihl = unsafe { (*ip_hdr_ptr).ihl() } as usize;
+    let l4_offset = l3_offset + (ihl * 4);
+
+    // STEP 4.1: Layer-4 TCP SYN Flood Rate Limiting
+    if ip_proto == IpProto::Tcp {
+        if let Some(tcp_ptr) = ptr_at::<TcpHdr>(ctx, l4_offset) {
+            let syn = unsafe { (*tcp_ptr).syn() };
+            let ack = unsafe { (*tcp_ptr).ack() };
+            if syn != 0 && ack == 0 {
+                let syn_state = TCP_SYN_RATE_LIMIT_MAP.get_ptr_mut(&src_ip);
+                let syn_allowed = match syn_state {
+                    Some(ptr) => unsafe {
+                        try_consume_token(&mut *ptr, TCP_SYN_BURST_CAPACITY, TCP_SYN_REFILL_RATE_NS, now_ns)
+                    },
+                    None => {
+                        let initial = RateLimitState {
+                            tokens: TCP_SYN_BURST_CAPACITY.saturating_sub(1),
+                            last_update_ns: now_ns,
+                        };
+                        let _ = TCP_SYN_RATE_LIMIT_MAP.insert(&src_ip, &initial, 0);
+                        true
+                    }
+                };
+                if !syn_allowed {
+                    record_tcp_syn(true);
+                    record_metric(false, packet_len);
+                    return Ok(xdp_action::XDP_DROP);
+                }
+                record_tcp_syn(false);
+            }
+        }
+    }
+
+    // STEP 4.2: Layer-4 UDP Reflection / Amplification Mitigation
+    if ip_proto == IpProto::Udp {
+        if let Some(udp_ptr) = ptr_at::<UdpHdr>(ctx, l4_offset) {
+            let src_port_raw = unsafe { core::ptr::addr_of!((*udp_ptr).source).read_unaligned() };
+            let src_port = u16::from_be(src_port_raw);
+            if (src_port == 53 || src_port == 123 || src_port == 1900 || src_port == 11211 || src_port == 389)
+                && packet_len > 512
+            {
+                record_udp_reflection_drop();
+                record_metric(false, packet_len);
+                return Ok(xdp_action::XDP_DROP);
+            }
+        }
+    }
 
     // STEP 5: Fast-Path for Known / Active Flows
     // If the source IP already has an entry in RATE_LIMIT_MAP, enforce per-IP bucket directly.
