@@ -1,0 +1,35 @@
+image:
+  repository: ghcr.io/rahadbhuiya/xdp-guard
+  tag: v0.3.0
+  pullPolicy: IfNotPresent
+
+config:
+  # Network interface to attach XDP filter to. Empty string will auto-detect the default route interface.
+  iface: ""
+  # XDP hook mode: skb (generic) or drv (native driver line-rate)
+  mode: "skb"
+  # Port for Prometheus metrics exporter daemon
+  metricsPort: 9184
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    cpu: 1000m
+    memory: 256Mi
+
+serviceMonitor:
+  enabled: true
+  interval: 10s
+  scrapeTimeout: 5s
+  labels:
+    release: prometheus
+
+tolerations:
+  - operator: Exists
+    effect: NoSchedule
+  - operator: Exists
+    effect: NoExecute
+
+priorityClassName: system-node-critical
