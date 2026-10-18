@@ -9,7 +9,7 @@ default-members = ["xdp-guard", "xdp-guard-common", "xtask"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 authors = ["Rahad Bhuiya <rahadbhuiya2021@gmail.com>"]
 license = "MIT OR Apache-2.0"

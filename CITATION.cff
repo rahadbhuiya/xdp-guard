@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software or cite this paper, please cite it as below."
+authors:
+  - family-names: "Bhuiya"
+    given-names: "Rahad"
+    email: "rahadbhuiya2021@gmail.com"
+    affiliation: "Independent Systems & Linux Kernel Researcher"
+title: "xdp-guard: A Memory-Safe, Line-Rate In-Kernel Firewall and Volumetric DDoS Mitigation Engine in Pure Rust via eBPF/XDP"
+version: 0.3.0
+date-released: 2026-10-18
+url: "https://github.com/rahadbhuiya/xdp-guard"
+repository-code: "https://github.com/rahadbhuiya/xdp-guard"
+license: "MIT OR Apache-2.0"
+keywords:
+  - ebpf
+  - xdp
+  - rust
+  - aya
+  - sched-ext
+  - ddos-mitigation
+  - linux-kernel
+  - rate-limiting
+abstract: "xdp-guard is an in-kernel packet filter and rate-limiting engine written strictly in pure Rust using the Aya eBPF framework. Executing at the network device driver level via XDP, it enforces line-rate deterministic drops prior to OS socket buffer allocations, incorporating in-kernel token-bucket rate limiting and empirical resilience against adversarial burst flooding under Linux 6.12 sched_ext schedulers."
