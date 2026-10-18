@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: xdp-guard-metrics
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: xdp-guard
+    app.kubernetes.io/part-of: xdp-guard-engine
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: xdp-guard
+  ports:
+    - name: metrics
+      port: 9184
+      targetPort: 9184
+      protocol: TCP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: xdp-guard
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: xdp-guard
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: xdp-guard
+  endpoints:
+    - port: metrics
+      interval: 10s
+      scrapeTimeout: 5s
+      path: /metrics

@@ -18,7 +18,10 @@ use bytesize::ByteSize;
 use clap::{Parser, Subcommand};
 use colored::*;
 use std::{net::Ipv4Addr, path::Path, time::Duration};
-use tokio::time::sleep;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    time::sleep,
+};
 use xdp_guard_common::{PacketStats, RuleValue};
 
 const BPF_FS_PATH: &str = "/sys/fs/bpf/xdp_guard";
@@ -76,6 +79,17 @@ enum Commands {
 
     /// Read live telemetry directly from kernel STATS_MAP
     Stats,
+
+    /// Run Prometheus metrics exporter HTTP daemon
+    Exporter {
+        /// HTTP listen address (e.g. 0.0.0.0:9184)
+        #[arg(short, long, default_value = "0.0.0.0:9184")]
+        listen: String,
+
+        /// Pinned stats map path
+        #[arg(long, default_value = "/sys/fs/bpf/xdp_guard/stats")]
+        stats_path: String,
+    },
 }
 
 #[tokio::main]
@@ -266,14 +280,165 @@ async fn main() -> Result<()> {
             let stats_path = format!("{}/stats", BPF_FS_PATH);
             monitor_live_stats(&stats_path).await?;
         }
+
+        Commands::Exporter { listen, stats_path } => {
+            run_exporter(&listen, &stats_path).await?;
+        }
     }
 
     Ok(())
 }
 
+async fn run_exporter(listen_addr: &str, stats_path: &str) -> Result<()> {
+    println!("{}", "=====================================================".cyan());
+    println!("  {} - Cloud-Native Prometheus Exporter", "XDP-GUARD".bold().green());
+    println!("  Listening address: http://{}", listen_addr.yellow());
+    println!("  Metrics endpoint:  http://{}/metrics", listen_addr.green());
+    println!("  Health endpoint:   http://{}/healthz", listen_addr.cyan());
+    println!("{}", "=====================================================".cyan());
+
+    let listener = tokio::net::TcpListener::bind(listen_addr)
+        .await
+        .with_context(|| format!("Failed to bind HTTP server to {}", listen_addr))?;
+
+    let stats_path_owned = stats_path.to_string();
+
+    loop {
+        let (mut socket, _peer) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                eprintln!("[!] Connection accept error: {}", e);
+                continue;
+            }
+        };
+
+        let path_clone = stats_path_owned.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let n = match socket.read(&mut buf).await {
+                Ok(n) if n > 0 => n,
+                _ => return,
+            };
+
+            let req_str = String::from_utf8_lossy(&buf[..n]);
+            let first_line = req_str.lines().next().unwrap_or("");
+            let req_path = first_line.split_whitespace().nth(1).unwrap_or("/");
+
+            let (status_line, content_type, body) = match req_path {
+                "/metrics" => {
+                    let stats = fetch_stats(&path_clone);
+                    let metrics = format_prometheus_metrics(&stats);
+                    (
+                        "HTTP/1.1 200 OK",
+                        "text/plain; version=0.0.4; charset=utf-8",
+                        metrics,
+                    )
+                }
+                "/healthz" | "/" => (
+                    "HTTP/1.1 200 OK",
+                    "application/json",
+                    "{\"status\":\"healthy\",\"service\":\"xdp-guard\"}\n".to_string(),
+                ),
+                _ => (
+                    "HTTP/1.1 404 NOT FOUND",
+                    "text/plain",
+                    "404 Not Found\n".to_string(),
+                ),
+            };
+
+            let response = format!(
+                "{}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status_line,
+                content_type,
+                body.len(),
+                body
+            );
+
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        });
+    }
+}
+
+fn fetch_stats(stats_path: &str) -> PacketStats {
+    #[cfg(target_os = "linux")]
+    {
+        if Path::new(stats_path).exists() {
+            if let Ok(map_data) = MapData::from_pin(stats_path) {
+                let map = Map::Array(map_data);
+                if let Ok(array) = Array::<MapData, PacketStats>::try_from(map) {
+                    if let Ok(stats) = array.get(&0, 0) {
+                        return stats;
+                    }
+                }
+            }
+        }
+    }
+    // Return empty / simulated stats if map is unavailable or on non-Linux
+    let _ = stats_path;
+    PacketStats::default()
+}
+
+fn format_prometheus_metrics(stats: &PacketStats) -> String {
+    let total = stats.passed_packets + stats.dropped_packets;
+    let ratio = if total > 0 {
+        (stats.dropped_packets as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    format!(
+        "# HELP xdp_guard_packets_passed_total Total packets passed to OS network stack\n\
+         # TYPE xdp_guard_packets_passed_total counter\n\
+         xdp_guard_packets_passed_total {}\n\n\
+         # HELP xdp_guard_bytes_passed_total Total payload bytes passed\n\
+         # TYPE xdp_guard_bytes_passed_total counter\n\
+         xdp_guard_bytes_passed_total {}\n\n\
+         # HELP xdp_guard_packets_dropped_total Total packets dropped at XDP line-rate\n\
+         # TYPE xdp_guard_packets_dropped_total counter\n\
+         xdp_guard_packets_dropped_total {}\n\n\
+         # HELP xdp_guard_bytes_dropped_total Total bytes dropped at XDP line-rate\n\
+         # TYPE xdp_guard_bytes_dropped_total counter\n\
+         xdp_guard_bytes_dropped_total {}\n\n\
+         # HELP xdp_guard_admission_drops_total Total spoofed flood admission drops\n\
+         # TYPE xdp_guard_admission_drops_total counter\n\
+         xdp_guard_admission_drops_total {}\n\n\
+         # HELP xdp_guard_subnet_drops_total Total /24 subnet aggregate rate limit drops\n\
+         # TYPE xdp_guard_subnet_drops_total counter\n\
+         xdp_guard_subnet_drops_total {}\n\n\
+         # HELP xdp_guard_map_insert_failures_total Total BPF map insertion failures\n\
+         # TYPE xdp_guard_map_insert_failures_total counter\n\
+         xdp_guard_map_insert_failures_total {}\n\n\
+         # HELP xdp_guard_tcp_syn_packets_total Total TCP SYN packets inspected\n\
+         # TYPE xdp_guard_tcp_syn_packets_total counter\n\
+         xdp_guard_tcp_syn_packets_total {}\n\n\
+         # HELP xdp_guard_tcp_syn_drops_total Total TCP SYN flood packets dropped\n\
+         # TYPE xdp_guard_tcp_syn_drops_total counter\n\
+         xdp_guard_tcp_syn_drops_total {}\n\n\
+         # HELP xdp_guard_udp_reflection_drops_total Total UDP amplification reflection packets dropped\n\
+         # TYPE xdp_guard_udp_reflection_drops_total counter\n\
+         xdp_guard_udp_reflection_drops_total {}\n\n\
+         # HELP xdp_guard_drop_ratio_percent Instantaneous packet drop ratio percentage\n\
+         # TYPE xdp_guard_drop_ratio_percent gauge\n\
+         xdp_guard_drop_ratio_percent {:.2}\n",
+        stats.passed_packets,
+        stats.passed_bytes,
+        stats.dropped_packets,
+        stats.dropped_bytes,
+        stats.admission_drops,
+        stats.subnet_drops,
+        stats.map_insert_failures,
+        stats.tcp_syn_packets,
+        stats.tcp_syn_drops,
+        stats.udp_reflection_drops,
+        ratio
+    )
+}
+
 async fn monitor_stats_loop(array: Array<MapData, PacketStats>) -> Result<()> {
-    println!("{:<10} | {:<20} | {:<20} | {:<16} | {:<14} | {:<10}", "TIME", "PASSED", "DROPPED", "ADM DROPS", "SUBNET DROPS", "DROP RATIO");
-    println!("--------------------------------------------------------------------------------------------------------------------");
+    println!("{:<8} | {:<18} | {:<18} | {:<9} | {:<8} | {:<9} | {:<9} | {:<8}", 
+        "TIME", "PASSED", "DROPPED", "ADM DROPS", "SUBNET", "SYN DROPS", "UDP DROPS", "RATIO");
+    println!("------------------------------------------------------------------------------------------------------------------");
 
     let mut last_dropped = 0;
     let mut last_passed = 0;
@@ -290,7 +455,7 @@ async fn monitor_stats_loop(array: Array<MapData, PacketStats>) -> Result<()> {
             };
 
             println!(
-                "{} | Pass: {:<7} ({:<6}) | Drop: {:<7} ({:<6}) | Adm: {:<10} | Subnet: {:<8} | Ratio: {:.2}%",
+                "{} | P: {:<6} ({:<5}) | D: {:<6} ({:<5}) | Adm: {:<4} | Sub: {:<4} | SYN: {:<4} | UDP: {:<4} | {:.2}%",
                 chrono::Local::now().format("%H:%M:%S"),
                 delta_passed,
                 ByteSize::b(stats.passed_bytes),
@@ -298,6 +463,8 @@ async fn monitor_stats_loop(array: Array<MapData, PacketStats>) -> Result<()> {
                 ByteSize::b(stats.dropped_bytes),
                 stats.admission_drops,
                 stats.subnet_drops,
+                stats.tcp_syn_drops,
+                stats.udp_reflection_drops,
                 ratio
             );
 
@@ -309,8 +476,9 @@ async fn monitor_stats_loop(array: Array<MapData, PacketStats>) -> Result<()> {
 }
 
 async fn monitor_live_stats(stats_path: &str) -> Result<()> {
-    println!("{:<10} | {:<20} | {:<20} | {:<16} | {:<14} | {:<10}", "TIME", "PASSED", "DROPPED", "ADM DROPS", "SUBNET DROPS", "DROP RATIO");
-    println!("--------------------------------------------------------------------------------------------------------------------");
+    println!("{:<8} | {:<18} | {:<18} | {:<9} | {:<8} | {:<9} | {:<9} | {:<8}", 
+        "TIME", "PASSED", "DROPPED", "ADM DROPS", "SUBNET", "SYN DROPS", "UDP DROPS", "RATIO");
+    println!("------------------------------------------------------------------------------------------------------------------");
 
     #[cfg(target_os = "linux")]
     {
