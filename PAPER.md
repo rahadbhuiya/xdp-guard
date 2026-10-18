@@ -149,6 +149,22 @@ When `xdp-guard attach` executes:
 
 Subsequent CLI commands (`block`, `unblock`, `allow`) retrieve the active file descriptor using `MapData::from_pin(&path)` and reconstruct an `aya::maps::HashMap<MapData, u32, RuleValue>`. This enables zero-latency runtime rule insertions directly into the kernel's hash tables without tearing down network interfaces or interrupting traffic flows.
 
+### 4.2 Layer-4 Stateful TCP SYN-Flood and UDP Amplification Defense
+
+While Layer-3 IP filtering and subnet aggregation effectively mitigate volumetric packet floods, adversarial campaigns often deploy transport-layer asymmetric attacks designed to exhaust kernel state tables:
+1. **TCP SYN Floods:** Attackers saturate server TCP connection tables (such as `tcp_max_syn_backlog`) by blasting `SYN=1, ACK=0` packets across randomized sources without ever completing the handshake with an `ACK`.
+2. **UDP Reflection/Amplification Floods:** Attackers spoof the target's IP and query public UDP services (DNS port 53, NTP monlist port 123, SSDP port 1900, Memcached port 11211, CLDAP port 389), which reflect multi-kilobyte responses back to the host at massive amplification ratios.
+
+To neutralize these threats, `xdp-guard` incorporates an in-kernel Layer-4 state engine:
+* **TCP SYN Guard:** When an incoming frame has `ip_proto == IpProto::Tcp`, the engine parses `TcpHdr` using verified packet boundary pointers. If `tcp.syn() != 0 && tcp.ack() == 0`, the packet is routed to a dedicated `TCP_SYN_RATE_LIMIT_MAP` LRU hash table. Each source IP is bounded to a dedicated connection burst allowance ($B_{syn} = 64$ tokens, $r_{syn} = 100\text{ conn/sec}$). Over-budget SYN packets are dropped at wire speed with `XDP_DROP` before reaching the OS socket layer.
+* **UDP Amplification Guard:** For `ip_proto == IpProto::Udp`, the engine inspects the source port against known amplification vectors. Unsolicited reflection responses exceeding standard payload bounds (> 512 bytes) are discarded directly at the driver hook.
+
+### 4.3 Cloud-Native Architecture: Prometheus Exporter and Kubernetes DaemonSet
+
+To facilitate fleet-wide deployment across cloud-native environments (such as Kubernetes worker nodes and high-density bare-metal AI training clusters), `xdp-guard` implements:
+1. **Prometheus Metrics Exporter (`xdp-guard exporter`):** An asynchronous HTTP daemon listening on `:9184/metrics` implemented in pure Rust using Tokio. The daemon polls the pinned `/sys/fs/bpf/xdp_guard/stats` map and renders standard Prometheus text-format telemetry (`xdp_guard_packets_passed_total`, `xdp_guard_packets_dropped_total`, `xdp_guard_tcp_syn_drops_total`, `xdp_guard_udp_reflection_drops_total`, etc.).
+2. **Kubernetes DaemonSet & Helm Packaging:** Turnkey deployment manifests and Helm charts (`charts/xdp-guard`) deploying `xdp-guard` natively across all cluster nodes with `hostNetwork: true`, bidirectional `bpffs` volume mounts, and automated Prometheus Operator `ServiceMonitor` discovery.
+
 ---
 
 ## 5. Experimental Evaluation & Validation
@@ -262,9 +278,8 @@ Dynamic runtime synchronization via pinned BPF maps allows seamless firewall rul
 
 Future extensions of `xdp-guard` include:
 1. **Hardware Offload Mode (`XDP_OFFLOAD`):** Executing compiled eBPF instructions directly on SmartNIC silicon (e.g., Netronome, Mellanox BlueField).
-2. **Layer-4 Protocol Filtering:** Deep inspection of TCP flags to combat advanced SYN/ACK reflection attacks.
-3. **Automated TTL Garbage Collection:** A user-space daemon to evict expired dynamic blocks automatically.
-4. **Cloud-Native Metrics:** Integrating a Prometheus exporter to publish real-time kernel telemetry to Grafana dashboards.
+2. **Automated TTL Garbage Collection:** An in-kernel timer or user-space daemon to evict expired dynamic blocks automatically.
+3. **Stateless SYN Cookie Synthesis:** Responding directly from XDP with cryptographic SYN cookies to eliminate server state entirely before three-way handshake completion.
 
 ---
 
