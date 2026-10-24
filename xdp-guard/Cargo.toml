@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "network-programming"]
 [dependencies]
 aya = "0.13"
 aya-log = "0.2"
-xdp-guard-common = { path = "../xdp-guard-common", version = "0.3.0", features = ["user"] }
+xdp-guard-common = { path = "../xdp-guard-common", version = "0.4.0", features = ["user"] }
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1.38", features = ["full"] }
 anyhow = "1.0"
