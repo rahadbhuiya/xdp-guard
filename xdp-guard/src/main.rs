@@ -418,6 +418,18 @@ fn format_prometheus_metrics(stats: &PacketStats) -> String {
          # HELP xdp_guard_udp_reflection_drops_total Total UDP amplification reflection packets dropped\n\
          # TYPE xdp_guard_udp_reflection_drops_total counter\n\
          xdp_guard_udp_reflection_drops_total {}\n\n\
+         # HELP xdp_guard_ipv6_subnet_drops_total Total IPv6 /64 subnet aggregate rate limit drops\n\
+         # TYPE xdp_guard_ipv6_subnet_drops_total counter\n\
+         xdp_guard_ipv6_subnet_drops_total {}\n\n\
+         # HELP xdp_guard_ipv6_per_ip_drops_total Total IPv6 /128 per-address rate limit drops\n\
+         # TYPE xdp_guard_ipv6_per_ip_drops_total counter\n\
+         xdp_guard_ipv6_per_ip_drops_total {}\n\n\
+         # HELP xdp_guard_ipv6_blocklist_drops_total Total IPv6 blocklist drops\n\
+         # TYPE xdp_guard_ipv6_blocklist_drops_total counter\n\
+         xdp_guard_ipv6_blocklist_drops_total {}\n\n\
+         # HELP xdp_guard_icmpv6_flood_drops_total Total ICMPv6 echo-request flood drops\n\
+         # TYPE xdp_guard_icmpv6_flood_drops_total counter\n\
+         xdp_guard_icmpv6_flood_drops_total {}\n\n\
          # HELP xdp_guard_drop_ratio_percent Instantaneous packet drop ratio percentage\n\
          # TYPE xdp_guard_drop_ratio_percent gauge\n\
          xdp_guard_drop_ratio_percent {:.2}\n",
@@ -431,14 +443,18 @@ fn format_prometheus_metrics(stats: &PacketStats) -> String {
         stats.tcp_syn_packets,
         stats.tcp_syn_drops,
         stats.udp_reflection_drops,
+        stats.ipv6_subnet_drops,
+        stats.ipv6_per_ip_drops,
+        stats.ipv6_blocklist_drops,
+        stats.icmpv6_flood_drops,
         ratio
     )
 }
 
 async fn monitor_stats_loop(array: Array<MapData, PacketStats>) -> Result<()> {
-    println!("{:<8} | {:<18} | {:<18} | {:<9} | {:<8} | {:<9} | {:<9} | {:<8}", 
-        "TIME", "PASSED", "DROPPED", "ADM DROPS", "SUBNET", "SYN DROPS", "UDP DROPS", "RATIO");
-    println!("------------------------------------------------------------------------------------------------------------------");
+    println!("{:<8} | {:<18} | {:<18} | {:<9} | {:<8} | {:<9} | {:<9} | {:<10} | {:<8}", 
+        "TIME", "PASSED", "DROPPED", "ADM DROPS", "SUBNET", "SYN DROPS", "UDP DROPS", "IPv6 SUB", "RATIO");
+    println!("----------------------------------------------------------------------------------------------------------------------------");
 
     let mut last_dropped = 0;
     let mut last_passed = 0;
@@ -455,7 +471,7 @@ async fn monitor_stats_loop(array: Array<MapData, PacketStats>) -> Result<()> {
             };
 
             println!(
-                "{} | P: {:<6} ({:<5}) | D: {:<6} ({:<5}) | Adm: {:<4} | Sub: {:<4} | SYN: {:<4} | UDP: {:<4} | {:.2}%",
+                "{} | P: {:<6} ({:<5}) | D: {:<6} ({:<5}) | Adm: {:<4} | Sub: {:<4} | SYN: {:<4} | UDP: {:<4} | v6S: {:<4} | {:.2}%",
                 chrono::Local::now().format("%H:%M:%S"),
                 delta_passed,
                 ByteSize::b(stats.passed_bytes),
@@ -465,6 +481,7 @@ async fn monitor_stats_loop(array: Array<MapData, PacketStats>) -> Result<()> {
                 stats.subnet_drops,
                 stats.tcp_syn_drops,
                 stats.udp_reflection_drops,
+                stats.ipv6_subnet_drops,
                 ratio
             );
 
@@ -476,9 +493,9 @@ async fn monitor_stats_loop(array: Array<MapData, PacketStats>) -> Result<()> {
 }
 
 async fn monitor_live_stats(stats_path: &str) -> Result<()> {
-    println!("{:<8} | {:<18} | {:<18} | {:<9} | {:<8} | {:<9} | {:<9} | {:<8}", 
-        "TIME", "PASSED", "DROPPED", "ADM DROPS", "SUBNET", "SYN DROPS", "UDP DROPS", "RATIO");
-    println!("------------------------------------------------------------------------------------------------------------------");
+    println!("{:<8} | {:<18} | {:<18} | {:<9} | {:<8} | {:<9} | {:<9} | {:<10} | {:<8}", 
+        "TIME", "PASSED", "DROPPED", "ADM DROPS", "SUBNET", "SYN DROPS", "UDP DROPS", "IPv6 SUB", "RATIO");
+    println!("----------------------------------------------------------------------------------------------------------------------------");
 
     #[cfg(target_os = "linux")]
     {
