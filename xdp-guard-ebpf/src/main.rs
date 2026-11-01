@@ -2,12 +2,14 @@
 //!
 //! Architecture:
 //! - L2 Ethernet parser with IEEE 802.1Q (VLAN) support
-//! - Fast-path Allowlist / Blocklist maps
-//! - Tier 1: /24 Subnet-level token bucket aggregator (mitigates host-rotating subnet floods)
-//! - Tier 2: Per-IP LRU token bucket rate limiter
+//! - Fast-path Allowlist / Blocklist maps (IPv4 + IPv6)
+//! - Tier 1: /24 Subnet-level token bucket aggregator for IPv4 (mitigates host-rotating subnet floods)
+//! - Tier 1 (IPv6): /64 Subnet-level LRU token bucket aggregator
+//! - Tier 2: Per-IP LRU token bucket rate limiter (IPv4 /32 and IPv6 /128)
 //! - Ingress Admission Control: Shared admission token bucket for new/unseen flows
 //!   (prevents spoofed randomized-IP floods from bypassing rate-limits on map insertion)
 //! - Monotonic fractional refill tracking (eliminates sub-millisecond clock drift)
+//! - Full dual-stack: EtherType 0x0800 (IPv4) + 0x86DD (IPv6)
 
 #![no_std]
 #![no_main]
@@ -21,7 +23,7 @@ use aya_ebpf::{
 };
 use network_types::{
     eth::{EthHdr, EtherType},
-    ip::{IpProto, Ipv4Hdr},
+    ip::{IpProto, Ipv4Hdr, Ipv6Hdr},
     tcp::TcpHdr,
     udp::UdpHdr,
 };
@@ -32,7 +34,7 @@ const PER_IP_CAPACITY: u64 = 1000; // Maximum burst tokens per IP
 const PER_IP_REFILL_RATE_NS: u64 = 1_000_000; // 1 token every 1ms (1,000 pkts/sec limit)
 const INITIAL_BURST_TOKENS: u64 = 10; // Conservative initial allowance on new IP insert
 
-/// Tier 1: /24 Subnet-Level Aggregate Limiting
+/// Tier 1: /24 Subnet-Level Aggregate Limiting (IPv4)
 const SUBNET_CAPACITY: u64 = 5000; // Maximum burst tokens per /24 prefix
 const SUBNET_REFILL_RATE_NS: u64 = 200_000; // 1 token every 200us (5,000 pkts/sec per /24)
 
@@ -43,6 +45,17 @@ const ADMISSION_REFILL_RATE_NS: u64 = 500_000; // 2,000 new source admissions / 
 /// Layer-4 TCP SYN Flood Mitigation
 const TCP_SYN_BURST_CAPACITY: u64 = 64; // Max burst of new TCP connection attempts per IP
 const TCP_SYN_REFILL_RATE_NS: u64 = 10_000_000; // 1 token every 10ms (100 new connections/sec per IP)
+
+/// IPv6 /64 Subnet-Level Aggregate Limiting
+const IPV6_SUBNET_CAPACITY: u64 = 5000;
+const IPV6_SUBNET_REFILL_RATE_NS: u64 = 200_000;
+
+/// Per-/128 IPv6 Address Rate Limiting
+const IPV6_PER_IP_CAPACITY: u64 = 1000;
+const IPV6_PER_IP_REFILL_RATE_NS: u64 = 1_000_000;
+
+/// ICMPv6 flood mitigation (echo request storms)
+const ICMPV6_TYPE_ECHO_REQUEST: u8 = 128;
 
 /// IEEE 802.1Q VLAN EtherTypes
 const ETH_P_8021Q: u16 = 0x8100;
@@ -80,6 +93,27 @@ static STATS_MAP: Array<PacketStats> = Array::<PacketStats>::with_max_entries(1,
 /// Map 6: Layer-4 TCP SYN Rate Limiter (Mitigates SYN-flood backlog exhaustion)
 #[map]
 static TCP_SYN_RATE_LIMIT_MAP: LruHashMap<u32, RateLimitState> = LruHashMap::<u32, RateLimitState>::with_max_entries(65536, 0);
+
+/// Map 7: IPv6 Fast-Path Allowlist ([u8;16] -> RuleValue)
+#[map]
+static IPV6_ALLOWLIST_MAP: HashMap<[u8; 16], RuleValue> =
+    HashMap::<[u8; 16], RuleValue>::with_max_entries(16384, 0);
+
+/// Map 8: IPv6 Blocklist ([u8;16] -> RuleValue)
+#[map]
+static IPV6_BLOCKLIST_MAP: HashMap<[u8; 16], RuleValue> =
+    HashMap::<[u8; 16], RuleValue>::with_max_entries(16384, 0);
+
+/// Map 9: IPv6 /64 Subnet Aggregate LRU Rate Limiter
+/// Keyed on the upper 8 bytes of the IPv6 source address (the /64 prefix).
+#[map]
+static IPV6_SUBNET_RATE_LIMIT_MAP: LruHashMap<[u8; 8], RateLimitState> =
+    LruHashMap::<[u8; 8], RateLimitState>::with_max_entries(32768, 0);
+
+/// Map 10: Per-/128 IPv6 Address LRU Rate Limiter
+#[map]
+static IPV6_RATE_LIMIT_MAP: LruHashMap<[u8; 16], RateLimitState> =
+    LruHashMap::<[u8; 16], RateLimitState>::with_max_entries(65536, 0);
 
 // HELPER FUNCTIONS
 
@@ -196,6 +230,38 @@ fn record_udp_reflection_drop() {
     }
 }
 
+/// Increments IPv6 /64 subnet aggregate drop counter.
+#[inline(always)]
+fn record_ipv6_subnet_drop() {
+    if let Some(stats_ptr) = STATS_MAP.get_ptr_mut(0) {
+        unsafe { (*stats_ptr).ipv6_subnet_drops += 1; }
+    }
+}
+
+/// Increments IPv6 /128 per-address drop counter.
+#[inline(always)]
+fn record_ipv6_per_ip_drop() {
+    if let Some(stats_ptr) = STATS_MAP.get_ptr_mut(0) {
+        unsafe { (*stats_ptr).ipv6_per_ip_drops += 1; }
+    }
+}
+
+/// Increments IPv6 blocklist drop counter.
+#[inline(always)]
+fn record_ipv6_blocklist_drop() {
+    if let Some(stats_ptr) = STATS_MAP.get_ptr_mut(0) {
+        unsafe { (*stats_ptr).ipv6_blocklist_drops += 1; }
+    }
+}
+
+/// Increments ICMPv6 echo-request flood drop counter.
+#[inline(always)]
+fn record_icmpv6_flood_drop() {
+    if let Some(stats_ptr) = STATS_MAP.get_ptr_mut(0) {
+        unsafe { (*stats_ptr).icmpv6_flood_drops += 1; }
+    }
+}
+
 // MAIN XDP PROGRAM HOOK
 
 #[xdp]
@@ -231,8 +297,12 @@ fn try_xdp_guard(ctx: &XdpContext) -> Result<u32, ()> {
         l3_offset += 4;
     }
 
-    // Only filter IPv4 traffic; pass non-IPv4 (ARP, IPv6, etc.) to the OS stack
+    // Route to appropriate L3 handler
+    if ether_type_val == EtherType::Ipv6 as u16 {
+        return handle_ipv6(ctx, l3_offset, packet_len);
+    }
     if ether_type_val != EtherType::Ipv4 as u16 {
+        // ARP, etc â€” pass to OS
         return Ok(xdp_action::XDP_PASS);
     }
 
@@ -387,6 +457,143 @@ fn try_xdp_guard(ctx: &XdpContext) -> Result<u32, ()> {
         record_metric(true, packet_len);
         Ok(xdp_action::XDP_PASS)
     }
+}
+
+/// IPv6 packet filtering pipeline.
+/// Implements: allowlist -> blocklist -> ICMPv6 flood -> /64 subnet bucket -> /128 per-IP bucket.
+#[inline(always)]
+fn handle_ipv6(ctx: &XdpContext, l3_offset: usize, packet_len: u64) -> Result<u32, ()> {
+    // Parse IPv6 fixed header (40 bytes)
+    let ip6_ptr = match ptr_at::<Ipv6Hdr>(ctx, l3_offset) {
+        Some(ptr) => ptr,
+        None => return Ok(xdp_action::XDP_PASS),
+    };
+
+    // Read source address as [u8; 16]
+    let src_addr: [u8; 16] = unsafe {
+        core::ptr::read_unaligned(
+            core::ptr::addr_of!((*ip6_ptr).src_addr) as *const [u8; 16]
+        )
+    };
+
+    // Fast-path: Allowlist check
+    if unsafe { IPV6_ALLOWLIST_MAP.get(&src_addr).is_some() } {
+        record_metric(true, packet_len);
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    // Blocklist check
+    if unsafe { IPV6_BLOCKLIST_MAP.get(&src_addr).is_some() } {
+        record_ipv6_blocklist_drop();
+        record_metric(false, packet_len);
+        return Ok(xdp_action::XDP_DROP);
+    }
+
+    let now_ns = unsafe { bpf_ktime_get_ns() };
+    let next_hdr = unsafe { core::ptr::addr_of!((*ip6_ptr).next_hdr).read_unaligned() };
+    let l4_offset = l3_offset + Ipv6Hdr::LEN;
+
+    // ICMPv6 echo-request flood mitigation
+    if next_hdr == IpProto::Ipv6Icmp as u8 {
+        // Read ICMPv6 type byte (first byte of ICMPv6 header)
+        if let Some(icmp_type_ptr) = ptr_at::<u8>(ctx, l4_offset) {
+            let icmp_type = unsafe { core::ptr::read_unaligned(icmp_type_ptr) };
+            if icmp_type == ICMPV6_TYPE_ECHO_REQUEST {
+                // Rate-limit ICMPv6 echo storms using the /128 bucket
+                let state = IPV6_RATE_LIMIT_MAP.get_ptr_mut(&src_addr);
+                if let Some(state_ptr) = state {
+                    let allowed = unsafe {
+                        try_consume_token(&mut *state_ptr, IPV6_PER_IP_CAPACITY, IPV6_PER_IP_REFILL_RATE_NS, now_ns)
+                    };
+                    if !allowed {
+                        record_icmpv6_flood_drop();
+                        record_metric(false, packet_len);
+                        return Ok(xdp_action::XDP_DROP);
+                    }
+                } else {
+                    let initial = RateLimitState {
+                        tokens: IPV6_PER_IP_CAPACITY.saturating_sub(1),
+                        last_update_ns: now_ns,
+                    };
+                    let _ = IPV6_RATE_LIMIT_MAP.insert(&src_addr, &initial, 0);
+                }
+                record_metric(true, packet_len);
+                return Ok(xdp_action::XDP_PASS);
+            }
+        }
+    }
+
+    // UDP reflection amplification mitigation for IPv6
+    if next_hdr == IpProto::Udp as u8 {
+        if let Some(udp_ptr) = ptr_at::<UdpHdr>(ctx, l4_offset) {
+            let src_port_raw = unsafe { core::ptr::addr_of!((*udp_ptr).source).read_unaligned() };
+            let src_port = u16::from_be(src_port_raw);
+            if (src_port == 53 || src_port == 123 || src_port == 1900 || src_port == 11211 || src_port == 389)
+                && packet_len > 512
+            {
+                record_udp_reflection_drop();
+                record_metric(false, packet_len);
+                return Ok(xdp_action::XDP_DROP);
+            }
+        }
+    }
+
+    // /64 Subnet Aggregate Rate Limiting
+    // Key = upper 8 bytes of src_addr (the /64 prefix)
+    let subnet64: [u8; 8] = [
+        src_addr[0], src_addr[1], src_addr[2], src_addr[3],
+        src_addr[4], src_addr[5], src_addr[6], src_addr[7],
+    ];
+
+    let subnet_state = IPV6_SUBNET_RATE_LIMIT_MAP.get_ptr_mut(&subnet64);
+    match subnet_state {
+        Some(subnet_ptr) => {
+            let allowed = unsafe {
+                try_consume_token(&mut *subnet_ptr, IPV6_SUBNET_CAPACITY, IPV6_SUBNET_REFILL_RATE_NS, now_ns)
+            };
+            if !allowed {
+                record_ipv6_subnet_drop();
+                record_metric(false, packet_len);
+                return Ok(xdp_action::XDP_DROP);
+            }
+        }
+        None => {
+            let initial = RateLimitState {
+                tokens: IPV6_SUBNET_CAPACITY.saturating_sub(1),
+                last_update_ns: now_ns,
+            };
+            let _ = IPV6_SUBNET_RATE_LIMIT_MAP.insert(&subnet64, &initial, 0);
+        }
+    }
+
+    // Per-/128 address rate limiting (fast-path for known flows)
+    let per_ip_state = IPV6_RATE_LIMIT_MAP.get_ptr_mut(&src_addr);
+    if let Some(state_ptr) = per_ip_state {
+        let allowed = unsafe {
+            try_consume_token(&mut *state_ptr, IPV6_PER_IP_CAPACITY, IPV6_PER_IP_REFILL_RATE_NS, now_ns)
+        };
+        if allowed {
+            record_metric(true, packet_len);
+            return Ok(xdp_action::XDP_PASS);
+        } else {
+            record_ipv6_per_ip_drop();
+            record_metric(false, packet_len);
+            return Ok(xdp_action::XDP_DROP);
+        }
+    }
+
+    // New IPv6 source â€” allocate /128 entry
+    let initial = RateLimitState {
+        tokens: INITIAL_BURST_TOKENS.saturating_sub(1),
+        last_update_ns: now_ns,
+    };
+    if IPV6_RATE_LIMIT_MAP.insert(&src_addr, &initial, 0).is_err() {
+        record_insert_failure();
+        record_metric(false, packet_len);
+        return Ok(xdp_action::XDP_DROP);
+    }
+    record_metric(true, packet_len);
+    Ok(xdp_action::XDP_PASS)
 }
 
 #[panic_handler]
