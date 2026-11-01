@@ -54,7 +54,12 @@ const IPV6_SUBNET_REFILL_RATE_NS: u64 = 200_000;
 const IPV6_PER_IP_CAPACITY: u64 = 1000;
 const IPV6_PER_IP_REFILL_RATE_NS: u64 = 1_000_000;
 
-/// ICMPv6 flood mitigation (echo request storms)
+/// Protocol numbers (raw u8) used in IPv4 proto / IPv6 next-header fields
+const PROTO_TCP: u8 = 6;
+const PROTO_UDP: u8 = 17;
+const PROTO_ICMPV6: u8 = 58; // ICMPv6 (RFC 4443)
+
+/// ICMPv6 Type 128 = Echo Request (ping6 flood mitigation)
 const ICMPV6_TYPE_ECHO_REQUEST: u8 = 128;
 
 /// IEEE 802.1Q VLAN EtherTypes
@@ -82,7 +87,8 @@ static RATE_LIMIT_MAP: LruHashMap<u32, RateLimitState> = LruHashMap::<u32, RateL
 
 /// Map 4: Shared Admission Limiter for Unseen Sources
 /// Index 0 stores the shared admission token bucket for incoming flows not yet in RATE_LIMIT_MAP.
-/// Under randomized-source floods, this admission budget is exhausted immediately, dropping spoofed packets.
+/// Under randomized-source floods, this admission pool drains in milliseconds,
+/// and all subsequent unseen packets are dropped at wire-speed with zero map churn.
 #[map]
 static ADMISSION_MAP: Array<RateLimitState> = Array::<RateLimitState>::with_max_entries(1, 0);
 
@@ -302,7 +308,7 @@ fn try_xdp_guard(ctx: &XdpContext) -> Result<u32, ()> {
         return handle_ipv6(ctx, l3_offset, packet_len);
     }
     if ether_type_val != EtherType::Ipv4 as u16 {
-        // ARP, etc â€” pass to OS
+        // ARP, etc -- pass to OS
         return Ok(xdp_action::XDP_PASS);
     }
 
@@ -395,10 +401,6 @@ fn try_xdp_guard(ctx: &XdpContext) -> Result<u32, ()> {
     }
 
     // STEP 6: Unseen / Unknown Source Gate (Ingress Admission Control)
-    // To prevent randomized-IP floods from churning either the per-IP LRU (131k) or the
-    // /24 subnet LRU (32k), unseen flows must first draw from the shared admission budget.
-    // Under a uniformly random spoofed flood, this admission pool drains in milliseconds,
-    // and all subsequent unseen packets are dropped at wire-speed with zero map churn.
     let admission_ptr = match ADMISSION_MAP.get_ptr_mut(0) {
         Some(ptr) => ptr,
         None => {
@@ -418,8 +420,6 @@ fn try_xdp_guard(ctx: &XdpContext) -> Result<u32, ()> {
     }
 
     // STEP 7: Tier 1 - /24 Subnet-Level Aggregate Limiter
-    // Flow passed admission. Now check the aggregate subnet budget to prevent concentrated
-    // prefix flooding from a single rogue network.
     let subnet_prefix = src_ip & 0xFFFF_FF00;
     let subnet_state = SUBNET_RATE_LIMIT_MAP.get_ptr_mut(&subnet_prefix);
 
@@ -461,20 +461,41 @@ fn try_xdp_guard(ctx: &XdpContext) -> Result<u32, ()> {
 
 /// IPv6 packet filtering pipeline.
 /// Implements: allowlist -> blocklist -> ICMPv6 flood -> /64 subnet bucket -> /128 per-IP bucket.
+///
+/// Note on src_addr extraction: Ipv6Hdr::src_addr is an in6_addr union. We read the raw bytes
+/// via ptr_at on the known offset (8 bytes into the IPv6 fixed header) to obtain [u8; 16]
+/// without depending on the in6_addr union field layout across compiler versions.
 #[inline(always)]
 fn handle_ipv6(ctx: &XdpContext, l3_offset: usize, packet_len: u64) -> Result<u32, ()> {
     // Parse IPv6 fixed header (40 bytes)
-    let ip6_ptr = match ptr_at::<Ipv6Hdr>(ctx, l3_offset) {
+    // Ensure the full header fits in the packet
+    if ptr_at::<Ipv6Hdr>(ctx, l3_offset).is_none() {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    // IPv6 header layout (RFC 2460):
+    //   0-3:   version(4) + traffic class(8) + flow label(20)
+    //   4-5:   payload length
+    //   6:     next header
+    //   7:     hop limit
+    //   8-23:  source address (16 bytes)
+    //   24-39: destination address (16 bytes)
+    //
+    // Read source address bytes directly at offset l3_offset + 8
+    let src_addr_ptr = match ptr_at::<[u8; 16]>(ctx, l3_offset + 8) {
         Some(ptr) => ptr,
         None => return Ok(xdp_action::XDP_PASS),
     };
+    let src_addr: [u8; 16] = unsafe { core::ptr::read_unaligned(src_addr_ptr) };
 
-    // Read source address as [u8; 16]
-    let src_addr: [u8; 16] = unsafe {
-        core::ptr::read_unaligned(
-            core::ptr::addr_of!((*ip6_ptr).src_addr) as *const [u8; 16]
-        )
+    // Read next-header byte at offset l3_offset + 6
+    let next_hdr_ptr = match ptr_at::<u8>(ctx, l3_offset + 6) {
+        Some(ptr) => ptr,
+        None => return Ok(xdp_action::XDP_PASS),
     };
+    let next_hdr: u8 = unsafe { core::ptr::read_unaligned(next_hdr_ptr) };
+
+    let l4_offset = l3_offset + Ipv6Hdr::LEN;
 
     // Fast-path: Allowlist check
     if unsafe { IPV6_ALLOWLIST_MAP.get(&src_addr).is_some() } {
@@ -490,16 +511,12 @@ fn handle_ipv6(ctx: &XdpContext, l3_offset: usize, packet_len: u64) -> Result<u3
     }
 
     let now_ns = unsafe { bpf_ktime_get_ns() };
-    let next_hdr = unsafe { core::ptr::addr_of!((*ip6_ptr).next_hdr).read_unaligned() };
-    let l4_offset = l3_offset + Ipv6Hdr::LEN;
 
     // ICMPv6 echo-request flood mitigation
-    if next_hdr == IpProto::Ipv6Icmp as u8 {
-        // Read ICMPv6 type byte (first byte of ICMPv6 header)
+    if next_hdr == PROTO_ICMPV6 {
         if let Some(icmp_type_ptr) = ptr_at::<u8>(ctx, l4_offset) {
             let icmp_type = unsafe { core::ptr::read_unaligned(icmp_type_ptr) };
             if icmp_type == ICMPV6_TYPE_ECHO_REQUEST {
-                // Rate-limit ICMPv6 echo storms using the /128 bucket
                 let state = IPV6_RATE_LIMIT_MAP.get_ptr_mut(&src_addr);
                 if let Some(state_ptr) = state {
                     let allowed = unsafe {
@@ -524,7 +541,7 @@ fn handle_ipv6(ctx: &XdpContext, l3_offset: usize, packet_len: u64) -> Result<u3
     }
 
     // UDP reflection amplification mitigation for IPv6
-    if next_hdr == IpProto::Udp as u8 {
+    if next_hdr == PROTO_UDP {
         if let Some(udp_ptr) = ptr_at::<UdpHdr>(ctx, l4_offset) {
             let src_port_raw = unsafe { core::ptr::addr_of!((*udp_ptr).source).read_unaligned() };
             let src_port = u16::from_be(src_port_raw);
@@ -539,7 +556,7 @@ fn handle_ipv6(ctx: &XdpContext, l3_offset: usize, packet_len: u64) -> Result<u3
     }
 
     // /64 Subnet Aggregate Rate Limiting
-    // Key = upper 8 bytes of src_addr (the /64 prefix)
+    // Key = upper 8 bytes of src_addr (network prefix of /64)
     let subnet64: [u8; 8] = [
         src_addr[0], src_addr[1], src_addr[2], src_addr[3],
         src_addr[4], src_addr[5], src_addr[6], src_addr[7],
@@ -582,7 +599,7 @@ fn handle_ipv6(ctx: &XdpContext, l3_offset: usize, packet_len: u64) -> Result<u3
         }
     }
 
-    // New IPv6 source â€” allocate /128 entry
+    // New IPv6 source -- allocate /128 entry with conservative burst
     let initial = RateLimitState {
         tokens: INITIAL_BURST_TOKENS.saturating_sub(1),
         last_update_ns: now_ns,
