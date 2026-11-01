@@ -80,6 +80,14 @@ pub struct PacketStats {
     pub tcp_syn_drops: u64,
     /// Total UDP reflection/amplification flood packets dropped.
     pub udp_reflection_drops: u64,
+    /// Total IPv6 packets dropped by /64 subnet aggregate rate limiting.
+    pub ipv6_subnet_drops: u64,
+    /// Total IPv6 /128 per-address packets dropped.
+    pub ipv6_per_ip_drops: u64,
+    /// Total IPv6 packets dropped by blocklist.
+    pub ipv6_blocklist_drops: u64,
+    /// Total IPv6 ICMPv6 flood packets dropped.
+    pub icmpv6_flood_drops: u64,
 }
 
 // Implement aya::Pod marker trait so userspace Aya can read/write these structs to BPF maps
