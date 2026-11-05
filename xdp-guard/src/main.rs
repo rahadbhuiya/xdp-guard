@@ -7,6 +7,9 @@
 //! - Attaches XDP hook to network interface (SKB/DRV modes)
 //! - Synchronizes pinned BPF Maps for dynamic runtime rule management
 //! - Streams live packet drop/pass telemetry directly from kernel array maps
+//! - Automated Threat Intelligence feed synchronization daemon (Spamhaus DROP, AbuseIPDB)
+
+pub mod intel;
 
 use anyhow::{Context, Result};
 use aya::{
@@ -31,7 +34,7 @@ const DEFAULT_EBPF_PATH: &str = "target/bpfel-unknown-none/release/xdp-guard-ebp
 #[command(
     name = "xdp-guard",
     author = "Rahad Bhuiya",
-    version = "0.1.0",
+    version = "0.4.0",
     about = "Production Linux XDP Firewall & Per-IP Rate Limiter in Rust (Aya)"
 )]
 struct Cli {
@@ -68,14 +71,10 @@ enum Commands {
     },
 
     /// Remove an IPv4 address from BLOCKLIST_MAP
-    Unblock {
-        ip: Ipv4Addr,
-    },
+    Unblock { ip: Ipv4Addr },
 
     /// Add an IPv4 address to the fast-path ALLOWLIST_MAP
-    Allow {
-        ip: Ipv4Addr,
-    },
+    Allow { ip: Ipv4Addr },
 
     /// Read live telemetry directly from kernel STATS_MAP
     Stats,
@@ -90,6 +89,37 @@ enum Commands {
         #[arg(long, default_value = "/sys/fs/bpf/xdp_guard/stats")]
         stats_path: String,
     },
+
+    /// Automatically synchronize dynamic Threat Intelligence feeds into eBPF BLOCKLIST_MAP
+    SyncFeeds {
+        /// Pinned blocklist BPF map path
+        #[arg(long, default_value = "/sys/fs/bpf/xdp_guard/blocklist")]
+        map_path: String,
+
+        /// Synchronize Spamhaus DROP & EDROP lists
+        #[arg(long, default_value_t = true)]
+        spamhaus: bool,
+
+        /// Synchronize AbuseIPDB blacklist
+        #[arg(long, default_value_t = false)]
+        abuseipdb: bool,
+
+        /// Optional AbuseIPDB API key
+        #[arg(long, env = "ABUSEIPDB_API_KEY")]
+        abuseipdb_key: Option<String>,
+
+        /// Custom threat feed URL (plain text or CSV)
+        #[arg(long)]
+        custom_url: Option<String>,
+
+        /// Sync interval in seconds (0 = run once and exit)
+        #[arg(short, long, default_value_t = 3600)]
+        interval: u64,
+
+        /// Expiration TTL in seconds for synchronized IPs (0 = permanent)
+        #[arg(long, default_value_t = 86400)]
+        ttl: u64,
+    },
 }
 
 #[tokio::main]
@@ -103,10 +133,19 @@ async fn main() -> Result<()> {
             mode,
             ebpf_path,
         } => {
-            println!("{}", "=====================================================".cyan());
-            println!("  {} - Linux Kernel XDP Defense Engine", "XDP-GUARD".bold().green());
+            println!(
+                "{}",
+                "=====================================================".cyan()
+            );
+            println!(
+                "  {} - Linux Kernel XDP Defense Engine",
+                "XDP-GUARD".bold().green()
+            );
             println!("  Author: Rahad Bhuiya | Pure Rust & Aya");
-            println!("{}", "=====================================================".cyan());
+            println!(
+                "{}",
+                "=====================================================".cyan()
+            );
 
             let flags = match mode.as_str() {
                 "drv" => XdpFlags::DRV_MODE,
@@ -114,14 +153,18 @@ async fn main() -> Result<()> {
                 _ => XdpFlags::SKB_MODE,
             };
 
-            println!("Loading eBPF bytecode from {} into Linux kernel...", ebpf_path);
+            println!(
+                "Loading eBPF bytecode from {} into Linux kernel...",
+                ebpf_path
+            );
             #[cfg(target_os = "linux")]
             {
                 let data = std::fs::read(&ebpf_path)
                     .with_context(|| format!("Failed to read eBPF binary from {}", ebpf_path))?;
                 println!("[+] eBPF binary loaded into memory ({} bytes)", data.len());
 
-                let mut bpf = Ebpf::load(&data).context("Failed to load eBPF program into kernel")?;
+                let mut bpf =
+                    Ebpf::load(&data).context("Failed to load eBPF program into kernel")?;
 
                 let program: &mut Xdp = bpf
                     .program_mut("xdp_guard_filter")
@@ -129,8 +172,9 @@ async fn main() -> Result<()> {
                     .try_into()?;
 
                 program.load().context("program.load() failed")?;
-                program.attach(&iface, flags).context("program.attach() failed")?;
-
+                program
+                    .attach(&iface, flags)
+                    .context("program.attach() failed")?;
 
                 // Ensure /sys/fs/bpf is mounted and directory exists
                 let _ = std::process::Command::new("mount")
@@ -146,7 +190,10 @@ async fn main() -> Result<()> {
                 // Pin maps to bpffs for runtime control across CLI invocations
                 if let Some(map) = bpf.take_map("BLOCKLIST_MAP") {
                     match map.pin(format!("{}/blocklist", BPF_FS_PATH)) {
-                        Ok(_) => println!("[+] Successfully pinned BLOCKLIST_MAP to {}/blocklist", BPF_FS_PATH),
+                        Ok(_) => println!(
+                            "[+] Successfully pinned BLOCKLIST_MAP to {}/blocklist",
+                            BPF_FS_PATH
+                        ),
                         Err(e) => eprintln!("[!] Error pinning blocklist: {}", e),
                     }
                 } else {
@@ -155,7 +202,10 @@ async fn main() -> Result<()> {
 
                 if let Some(map) = bpf.take_map("ALLOWLIST_MAP") {
                     match map.pin(format!("{}/allowlist", BPF_FS_PATH)) {
-                        Ok(_) => println!("[+] Successfully pinned ALLOWLIST_MAP to {}/allowlist", BPF_FS_PATH),
+                        Ok(_) => println!(
+                            "[+] Successfully pinned ALLOWLIST_MAP to {}/allowlist",
+                            BPF_FS_PATH
+                        ),
                         Err(e) => eprintln!("[!] Error pinning allowlist: {}", e),
                     }
                 } else {
@@ -163,14 +213,17 @@ async fn main() -> Result<()> {
                 }
 
                 // Keep stats_map in memory for the active daemon loop
-                let stats_map: Option<Array<MapData, PacketStats>> = bpf
-                    .take_map("STATS_MAP")
-                    .and_then(|m| {
+                let stats_map: Option<Array<MapData, PacketStats>> =
+                    bpf.take_map("STATS_MAP").and_then(|m| {
                         let _ = m.pin(format!("{}/stats", BPF_FS_PATH));
                         Array::<MapData, PacketStats>::try_from(m).ok()
                     });
 
-                println!("[+] Attached to interface: {} (Mode: {})", iface.yellow(), mode.green());
+                println!(
+                    "[+] Attached to interface: {} (Mode: {})",
+                    iface.yellow(),
+                    mode.green()
+                );
 
                 if let Some(stats_array) = stats_map {
                     monitor_stats_loop(stats_array).await?;
@@ -182,7 +235,11 @@ async fn main() -> Result<()> {
             #[cfg(not(target_os = "linux"))]
             {
                 println!("[i] Host OS is Windows/macOS. XDP kernel loader requires Linux.");
-                println!("[i] Target interface: {} (Mode: {})", iface.yellow(), mode.green());
+                println!(
+                    "[i] Target interface: {} (Mode: {})",
+                    iface.yellow(),
+                    mode.green()
+                );
                 println!("[i] Ready for execution under VMware Kali Linux or Linux WSL kernel.");
             }
         }
@@ -198,7 +255,11 @@ async fn main() -> Result<()> {
 
         Commands::Block { ip, ttl } => {
             let ip_u32 = u32::from(ip);
-            println!("{} Inserting IP {} into BLOCKLIST_MAP...", "[!]".red().bold(), ip);
+            println!(
+                "{} Inserting IP {} into BLOCKLIST_MAP...",
+                "[!]".red().bold(),
+                ip
+            );
 
             #[cfg(target_os = "linux")]
             {
@@ -216,18 +277,26 @@ async fn main() -> Result<()> {
                         ttl_secs: ttl,
                     };
                     hash_map.insert(ip_u32, rule, 0)?;
-                    println!("{} IP successfully blocked in kernel.", "[SUCCESS]".green().bold());
+                    println!(
+                        "{} IP successfully blocked in kernel.",
+                        "[SUCCESS]".green().bold()
+                    );
                 } else {
-                    eprintln!("[-] Error: xdp-guard is not currently attached. Run `attach` first.");
+                    eprintln!(
+                        "[-] Error: xdp-guard is not currently attached. Run `attach` first."
+                    );
                 }
             }
 
             #[cfg(not(target_os = "linux"))]
-            println!("{} Configured IP {} (0x{:08X}) for kernel block.", "[SIM]".yellow(), ip, ip_u32);
+            println!(
+                "{} Configured IP {} (0x{:08X}) for kernel block.",
+                "[SIM]".yellow(),
+                ip,
+                ip_u32
+            );
         }
 
-
-        
         Commands::Unblock { ip } => {
             let ip_u32 = u32::from(ip);
             println!("Removing IP {} from BLOCKLIST_MAP...", ip);
@@ -268,7 +337,10 @@ async fn main() -> Result<()> {
                         ttl_secs: 0,
                     };
                     hash_map.insert(ip_u32, rule, 0)?;
-                    println!("{} Fast-path allowlist updated.", "[SUCCESS]".green().bold());
+                    println!(
+                        "{} Fast-path allowlist updated.",
+                        "[SUCCESS]".green().bold()
+                    );
                 }
             }
 
@@ -284,18 +356,75 @@ async fn main() -> Result<()> {
         Commands::Exporter { listen, stats_path } => {
             run_exporter(&listen, &stats_path).await?;
         }
+
+        Commands::SyncFeeds {
+            map_path,
+            spamhaus,
+            abuseipdb,
+            abuseipdb_key,
+            custom_url,
+            interval,
+            ttl,
+        } => {
+            let mut providers = Vec::new();
+            if spamhaus {
+                providers.push(intel::ThreatFeedProvider::SpamhausDrop);
+            }
+            if abuseipdb {
+                providers.push(intel::ThreatFeedProvider::AbuseIpDb {
+                    api_key: abuseipdb_key,
+                });
+            }
+            if let Some(url) = custom_url {
+                providers.push(intel::ThreatFeedProvider::CustomUrl(url));
+            }
+
+            if providers.is_empty() {
+                eprintln!("[-] Error: No threat intelligence feeds selected. Enable --spamhaus or provide --custom-url");
+                return Ok(());
+            }
+
+            if interval == 0 {
+                // One-shot synchronization
+                println!("Running single threat intelligence sync cycle...");
+                let stats = intel::run_threat_sync_cycle(&map_path, &providers, ttl).await?;
+                println!(
+                    "{} Feed sync complete: {} parsed, {} unique IPs, {} synced to kernel BPF (Errors: {})",
+                    "[SUCCESS]".green().bold(),
+                    stats.total_parsed,
+                    stats.unique_ips,
+                    stats.newly_blocked,
+                    stats.errors
+                );
+            } else {
+                // Persistent background synchronization daemon
+                intel::run_sync_daemon(&map_path, providers, interval, ttl).await?;
+            }
+        }
     }
 
     Ok(())
 }
 
 async fn run_exporter(listen_addr: &str, stats_path: &str) -> Result<()> {
-    println!("{}", "=====================================================".cyan());
-    println!("  {} - Cloud-Native Prometheus Exporter", "XDP-GUARD".bold().green());
+    println!(
+        "{}",
+        "=====================================================".cyan()
+    );
+    println!(
+        "  {} - Cloud-Native Prometheus Exporter",
+        "XDP-GUARD".bold().green()
+    );
     println!("  Listening address: http://{}", listen_addr.yellow());
-    println!("  Metrics endpoint:  http://{}/metrics", listen_addr.green());
+    println!(
+        "  Metrics endpoint:  http://{}/metrics",
+        listen_addr.green()
+    );
     println!("  Health endpoint:   http://{}/healthz", listen_addr.cyan());
-    println!("{}", "=====================================================".cyan());
+    println!(
+        "{}",
+        "=====================================================".cyan()
+    );
 
     let listener = tokio::net::TcpListener::bind(listen_addr)
         .await
@@ -374,7 +503,6 @@ fn fetch_stats(stats_path: &str) -> PacketStats {
             }
         }
     }
-    // Return empty / simulated stats if map is unavailable or on non-Linux
     let _ = stats_path;
     PacketStats::default()
 }
@@ -436,8 +564,10 @@ fn format_prometheus_metrics(stats: &PacketStats) -> String {
 }
 
 async fn monitor_stats_loop(array: Array<MapData, PacketStats>) -> Result<()> {
-    println!("{:<8} | {:<18} | {:<18} | {:<9} | {:<8} | {:<9} | {:<9} | {:<8}", 
-        "TIME", "PASSED", "DROPPED", "ADM DROPS", "SUBNET", "SYN DROPS", "UDP DROPS", "RATIO");
+    println!(
+        "{:<8} | {:<18} | {:<18} | {:<9} | {:<8} | {:<9} | {:<9} | {:<8}",
+        "TIME", "PASSED", "DROPPED", "ADM DROPS", "SUBNET", "SYN DROPS", "UDP DROPS", "RATIO"
+    );
     println!("------------------------------------------------------------------------------------------------------------------");
 
     let mut last_dropped = 0;
@@ -476,8 +606,10 @@ async fn monitor_stats_loop(array: Array<MapData, PacketStats>) -> Result<()> {
 }
 
 async fn monitor_live_stats(stats_path: &str) -> Result<()> {
-    println!("{:<8} | {:<18} | {:<18} | {:<9} | {:<8} | {:<9} | {:<9} | {:<8}", 
-        "TIME", "PASSED", "DROPPED", "ADM DROPS", "SUBNET", "SYN DROPS", "UDP DROPS", "RATIO");
+    println!(
+        "{:<8} | {:<18} | {:<18} | {:<9} | {:<8} | {:<9} | {:<9} | {:<8}",
+        "TIME", "PASSED", "DROPPED", "ADM DROPS", "SUBNET", "SYN DROPS", "UDP DROPS", "RATIO"
+    );
     println!("------------------------------------------------------------------------------------------------------------------");
 
     #[cfg(target_os = "linux")]
@@ -488,13 +620,19 @@ async fn monitor_live_stats(stats_path: &str) -> Result<()> {
             let array = Array::<MapData, PacketStats>::try_from(map)?;
             monitor_stats_loop(array).await?;
         } else {
-            eprintln!("[-] Pinned stats map not found at {}. Is xdp-guard running?", stats_path);
+            eprintln!(
+                "[-] Pinned stats map not found at {}. Is xdp-guard running?",
+                stats_path
+            );
         }
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        println!("[i] Reading kernel telemetry requires Linux bpffs mounted at {}", stats_path);
+        println!(
+            "[i] Reading kernel telemetry requires Linux bpffs mounted at {}",
+            stats_path
+        );
     }
 
     Ok(())
