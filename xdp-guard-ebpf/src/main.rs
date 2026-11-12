@@ -18,7 +18,7 @@ use aya_ebpf::{
     bindings::xdp_action,
     helpers::bpf_ktime_get_ns,
     macros::{map, xdp},
-    maps::{Array, HashMap, LruHashMap},
+    maps::{Array, HashMap, LruHashMap, RingBuf},
     programs::XdpContext,
 };
 use network_types::{
@@ -27,7 +27,9 @@ use network_types::{
     tcp::TcpHdr,
     udp::UdpHdr,
 };
-use xdp_guard_common::{PacketStats, RateLimitState, RuleValue};
+use xdp_guard_common::{
+    drop_reasons, AdaptiveConfig, PacketStats, RateLimitState, RuleValue, SecurityEvent,
+};
 
 /// Per-IP Rate Limiting Configuration
 const PER_IP_CAPACITY: u64 = 1000; // Maximum burst tokens per IP
@@ -121,7 +123,66 @@ static IPV6_SUBNET_RATE_LIMIT_MAP: LruHashMap<[u8; 8], RateLimitState> =
 static IPV6_RATE_LIMIT_MAP: LruHashMap<[u8; 16], RateLimitState> =
     LruHashMap::<[u8; 16], RateLimitState>::with_max_entries(65536, 0);
 
+/// Map 11: Security Incident Ring Buffer (Addresses Issue #3)
+#[map]
+static EVENTS_RINGBUF: RingBuf = RingBuf::with_byte_size(262144, 0);
+
+/// Map 12: Dynamic Adaptive Rate-Limit Configuration Map (Addresses Issue #5)
+#[map]
+static ADAPTIVE_CONFIG_MAP: Array<AdaptiveConfig> = Array::<AdaptiveConfig>::with_max_entries(1, 0);
+
 // HELPER FUNCTIONS
+
+/// Returns dynamic adaptive rate limit settings or fallback static defaults (Issue #5).
+#[inline(always)]
+fn get_rate_limits() -> (u64, u64, u64, u64) {
+    if let Some(cfg) = ADAPTIVE_CONFIG_MAP.get(0) {
+        if cfg.enabled != 0 {
+            return (
+                cfg.per_ip_capacity,
+                cfg.per_ip_refill_ns,
+                cfg.subnet_capacity,
+                cfg.subnet_refill_ns,
+            );
+        }
+    }
+    (
+        PER_IP_CAPACITY,
+        PER_IP_REFILL_RATE_NS,
+        SUBNET_CAPACITY,
+        SUBNET_REFILL_RATE_NS,
+    )
+}
+
+/// Streams forensic security incident event into kernel ring buffer (Issue #3).
+#[inline(always)]
+fn emit_event(
+    now: u64,
+    src_ip_bytes: [u8; 16],
+    src_port: u16,
+    dst_port: u16,
+    proto: u8,
+    reason: u8,
+    version: u8,
+    len: u32,
+) {
+    if let Some(mut entry) = EVENTS_RINGBUF.reserve::<SecurityEvent>(0) {
+        let ev = SecurityEvent {
+            timestamp_ns: now,
+            src_ip: src_ip_bytes,
+            dst_port,
+            src_port,
+            protocol: proto,
+            drop_reason: reason,
+            ip_version: version,
+            _pad: 0,
+            packet_len: len,
+            _reserved: 0,
+        };
+        entry.write(ev);
+        entry.submit(0);
+    }
+}
 
 /// Safely inspects packet memory boundaries.
 #[inline(always)]

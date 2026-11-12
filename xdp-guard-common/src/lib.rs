@@ -99,3 +99,187 @@ unsafe impl aya::Pod for RateLimitState {}
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for PacketStats {}
+
+/// High-fidelity forensic event captured by the XDP engine on dropped or throttled packets.
+///
+/// Streamed from the Linux kernel to userspace via `BPF_MAP_TYPE_RINGBUF` (Addresses Issue #3).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable, PartialEq, Eq)]
+pub struct SecurityEvent {
+    /// Monotonic timestamp in nanoseconds when packet arrived (bpf_ktime_get_ns).
+    pub timestamp_ns: u64,
+    /// Source IP address bytes (IPv4 in lower 4 bytes or full IPv6).
+    pub src_ip: [u8; 16],
+    /// Destination port (host byte order).
+    pub dst_port: u16,
+    /// Source port (host byte order).
+    pub src_port: u16,
+    /// IP Protocol (6 = TCP, 17 = UDP, 58 = ICMPv6, etc.).
+    pub protocol: u8,
+    /// Drop reason code from `drop_reasons`.
+    pub drop_reason: u8,
+    /// IP Version (4 or 6).
+    pub ip_version: u8,
+    /// Explicit padding byte for 8-byte alignment.
+    pub _pad: u8,
+    /// Total packet length in wire bytes.
+    pub packet_len: u32,
+    /// Reserved for future flags / telemetry.
+    pub _reserved: u32,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for SecurityEvent {}
+
+/// Security drop reason constants for `SecurityEvent`.
+pub mod drop_reasons {
+    pub const BLOCKLIST: u8 = 1;
+    pub const PER_IP_RATE_LIMIT: u8 = 2;
+    pub const SUBNET_RATE_LIMIT: u8 = 3;
+    pub const TCP_SYN_FLOOD: u8 = 4;
+    pub const UDP_REFLECTION: u8 = 5;
+    pub const ADMISSION_EXHAUSTION: u8 = 6;
+    pub const IPV6_ICMPV6_FLOOD: u8 = 7;
+
+    pub fn as_str(reason: u8) -> &'static str {
+        match reason {
+            BLOCKLIST => "BLOCKLIST",
+            PER_IP_RATE_LIMIT => "PER_IP_RATE_LIMIT",
+            SUBNET_RATE_LIMIT => "SUBNET_RATE_LIMIT",
+            TCP_SYN_FLOOD => "TCP_SYN_FLOOD",
+            UDP_REFLECTION => "UDP_REFLECTION",
+            ADMISSION_EXHAUSTION => "ADMISSION_EXHAUSTION",
+            IPV6_ICMPV6_FLOOD => "IPV6_ICMPV6_FLOOD",
+            _ => "UNKNOWN",
+        }
+    }
+}
+
+/// Dynamic rate-limiting configuration for adaptive threshold auto-tuning.
+///
+/// Written by userspace auto-tuning daemon into an eBPF Array map without reloading bytecode
+/// (Addresses Issue #5).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable, PartialEq, Eq)]
+pub struct AdaptiveConfig {
+    /// Dynamic per-IP token burst ceiling.
+    pub per_ip_capacity: u64,
+    /// Dynamic per-IP refill interval in nanoseconds (1 token every N ns).
+    pub per_ip_refill_ns: u64,
+    /// Dynamic subnet token burst ceiling.
+    pub subnet_capacity: u64,
+    /// Dynamic subnet refill interval in nanoseconds.
+    pub subnet_refill_ns: u64,
+    /// Observed baseline packet rate in pps (e.g. p95 across recent window).
+    pub baseline_pps: u64,
+    /// Scaling multiplier in thousandths (e.g. 3000 = 3.0x threshold above baseline).
+    pub multiplier_x1000: u32,
+    /// 1 = adaptive threshold active; 0 = static mode.
+    pub enabled: u32,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for AdaptiveConfig {}
+
+impl Default for AdaptiveConfig {
+    fn default() -> Self {
+        Self {
+            per_ip_capacity: 1000,
+            per_ip_refill_ns: 1_000_000, // 1,000 pps
+            subnet_capacity: 5000,
+            subnet_refill_ns: 200_000, // 5,000 pps
+            baseline_pps: 500,
+            multiplier_x1000: 3000, // 3.0x
+            enabled: 0,
+        }
+    }
+}
+
+impl AdaptiveConfig {
+    /// Calculate new dynamic rate limits from an observed baseline PPS and user-defined constraints.
+    pub fn compute_tuned(
+        baseline_pps: u64,
+        multiplier: f32,
+        min_pps: u64,
+        max_pps: u64,
+    ) -> Self {
+        let scaled_pps = ((baseline_pps as f64) * (multiplier as f64)) as u64;
+        let clamped_pps = if scaled_pps < min_pps {
+            min_pps
+        } else if scaled_pps > max_pps {
+            max_pps
+        } else {
+            scaled_pps
+        };
+        let clamped_pps = if clamped_pps == 0 { 1 } else { clamped_pps };
+
+        let refill_ns = 1_000_000_000 / clamped_pps;
+        let capacity = if clamped_pps / 2 < 10 { 10 } else { clamped_pps / 2 };
+
+        Self {
+            per_ip_capacity: capacity,
+            per_ip_refill_ns: refill_ns,
+            subnet_capacity: capacity * 5,
+            subnet_refill_ns: if refill_ns / 5 == 0 { 1 } else { refill_ns / 5 },
+            baseline_pps,
+            multiplier_x1000: (multiplier * 1000.0) as u32,
+            enabled: 1,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_security_event_memory_layout() {
+        assert_eq!(core::mem::size_of::<SecurityEvent>(), 40);
+        assert_eq!(core::mem::align_of::<SecurityEvent>(), 8);
+
+        let event = SecurityEvent {
+            timestamp_ns: 123456789,
+            src_ip: [192, 168, 1, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            dst_port: 80,
+            src_port: 44123,
+            protocol: 6,
+            drop_reason: drop_reasons::TCP_SYN_FLOOD,
+            ip_version: 4,
+            _pad: 0,
+            packet_len: 64,
+            _reserved: 0,
+        };
+
+        let bytes = bytemuck::bytes_of(&event);
+        assert_eq!(bytes.len(), 40);
+        let decoded: &SecurityEvent = bytemuck::from_bytes(bytes);
+        assert_eq!(decoded.timestamp_ns, 123456789);
+        assert_eq!(decoded.dst_port, 80);
+        assert_eq!(decoded.drop_reason, drop_reasons::TCP_SYN_FLOOD);
+        assert_eq!(drop_reasons::as_str(decoded.drop_reason), "TCP_SYN_FLOOD");
+    }
+
+    #[test]
+    fn test_adaptive_config_compute_tuned() {
+        assert_eq!(core::mem::size_of::<AdaptiveConfig>(), 48);
+        assert_eq!(core::mem::align_of::<AdaptiveConfig>(), 8);
+
+        // Baseline: 1000 pps, Multiplier: 3.0x -> 3000 pps
+        let cfg = AdaptiveConfig::compute_tuned(1000, 3.0, 500, 50000);
+        assert_eq!(cfg.enabled, 1);
+        assert_eq!(cfg.baseline_pps, 1000);
+        assert_eq!(cfg.multiplier_x1000, 3000);
+        assert_eq!(cfg.per_ip_refill_ns, 1_000_000_000 / 3000);
+        assert_eq!(cfg.per_ip_capacity, 1500);
+
+        // Clamping to floor
+        let cfg_floor = AdaptiveConfig::compute_tuned(10, 2.0, 1000, 50000);
+        assert_eq!(cfg_floor.per_ip_refill_ns, 1_000_000); // 1000 pps floor
+        assert_eq!(cfg_floor.per_ip_capacity, 500);
+
+        // Clamping to ceiling
+        let cfg_ceil = AdaptiveConfig::compute_tuned(100_000, 3.0, 1000, 50_000);
+        assert_eq!(cfg_ceil.per_ip_refill_ns, 1_000_000_000 / 50_000);
+        assert_eq!(cfg_ceil.per_ip_capacity, 25_000);
+    }
+}
