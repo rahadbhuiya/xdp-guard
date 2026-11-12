@@ -744,14 +744,15 @@ async fn monitor_security_events(json: bool, count: u64) -> Result<()> {
         }
 
         let map_data = MapData::from_pin(&ringbuf_path)?;
-        let mut ring_buf = aya::maps::RingBuf::try_from(map_data)?;
+        let map = Map::RingBuf(map_data);
+        let mut ring_buf = aya::maps::RingBuf::<MapData>::try_from(map)?;
 
         let mut events_seen = 0u64;
         loop {
             while let Some(item) = ring_buf.next() {
                 if item.len() >= std::mem::size_of::<SecurityEvent>() {
-                    let event: &SecurityEvent =
-                        bytemuck::from_bytes(&item[..std::mem::size_of::<SecurityEvent>()]);
+                    let event: SecurityEvent =
+                        bytemuck::pod_read_unaligned(&item[..std::mem::size_of::<SecurityEvent>()]);
                     let src_ip_str = if event.ip_version == 4 {
                         format!("{}.{}.{}.{}", event.src_ip[0], event.src_ip[1], event.src_ip[2], event.src_ip[3])
                     } else {
