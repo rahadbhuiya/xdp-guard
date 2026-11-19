@@ -12,5 +12,5 @@ resolver = "2"
 version = "0.4.1"
 edition = "2021"
 authors = ["Rahad Bhuiya <rahadbhuiya2021@gmail.com>"]
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-or-later"
 repository = "https://github.com/rahadbhuiya/xdp-guard"

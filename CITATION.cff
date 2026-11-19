@@ -10,7 +10,7 @@ version: 0.3.0
 date-released: 2026-10-18
 url: "https://github.com/rahadbhuiya/xdp-guard"
 repository-code: "https://github.com/rahadbhuiya/xdp-guard"
-license: "MIT OR Apache-2.0"
+license: "AGPL-3.0-or-later"
 keywords:
   - ebpf
   - xdp

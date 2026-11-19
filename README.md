@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/xdp-guard.svg)](https://crates.io/crates/xdp-guard)
 [![CI](https://github.com/rahadbhuiya/xdp-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/rahadbhuiya/xdp-guard/actions/workflows/ci.yml)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23120995.svg)](https://doi.org/10.5281/zenodo.23120995)
-[![License: MIT / Apache-2.0](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 [![Framework: Aya](https://img.shields.io/badge/eBPF-Aya-orange.svg)](https://github.com/aya-rs/aya)
 
 A high-performance, line-rate Linux kernel firewall and per-IP rate limiter built in Rust using the Aya eBPF framework.
@@ -165,6 +165,16 @@ If you use `xdp-guard` or reference its in-kernel architecture in your research,
 }
 ```
 
-## License
+## License & Commercial Inquiries
 
-Licensed under either of MIT or Apache-2.0.
+`xdp-guard` is dual-licensed under open-source and commercial terms:
+
+### 1. Open Source (GNU AGPLv3)
+For open-source projects, academic benchmarking, and non-commercial edge protection, this software is licensed under the **GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)**.
+Under this license, any cloud hosting provider, datacenter operator, SaaS platform, or security vendor incorporating or linking `xdp-guard` into network-facing workloads must make their complete source code available under compatible copyleft terms when distributed or deployed over a network. See [LICENSE](LICENSE) for the full text.
+
+### 2. Proprietary Commercial License
+For cloud infrastructure vendors, managed security service providers (MSSPs), hosting companies, and proprietary networking appliance manufacturers who wish to embed `xdp-guard` within proprietary closed-source infrastructure or commercial security suites without AGPLv3 copyleft obligations:
+- Commercial licenses are available without copyleft requirements.
+- Includes custom eBPF map tuning, hardware offload acceleration, dedicated BPF kernel integration, and SLA support.
+- For commercial licensing terms, custom deployments, and volume licensing, contact: **`rahadbhuiya2021@gmail.com`**.
